@@ -1,6 +1,6 @@
 """
 A股每日数据抓取 + 启动形态选股脚本
-数据源：东方财富（主）+ 新浪财经（备用），通过 akshare 库
+数据源：新浪财经（主，对境外IP友好）
 """
 import os
 import json
@@ -16,7 +16,6 @@ supabase = create_client(
 )
 
 def retry(func, max_attempts=3, delay=3, *args, **kwargs):
-    """通用重试包装器"""
     last_err = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -29,21 +28,29 @@ def retry(func, max_attempts=3, delay=3, *args, **kwargs):
     print(f"  重试{max_attempts}次后仍失败: {last_err}")
     return None
 
+def get_sina_symbol(code):
+    """把代码转换成新浪格式 sh600000 / sz000001 / bj830xxx"""
+    code = str(code).zfill(6)
+    if code.startswith('6'):
+        return f"sh{code}"
+    elif code.startswith(('0', '3')):
+        return f"sz{code}"
+    elif code.startswith(('4', '8', '9')):
+        return f"bj{code}"
+    return f"sh{code}"
+
 def get_stock_list():
-    """获取 A股股票列表，主接口失败则降级到备用接口"""
-    # 主接口：东方财富
-    df = retry(ak.stock_zh_a_spot_em, max_attempts=3, delay=5)
+    """获取 A股股票列表，主接口东财失败则用新浪"""
+    df = retry(ak.stock_zh_a_spot_em, max_attempts=2, delay=3)
     if df is not None and not df.empty:
         print(f"  东方财富接口成功，获取 {len(df)} 条")
         df = df[~df['名称'].str.contains('ST|退', na=False)]
         return df[['代码', '名称']].head(300)
 
-    # 备用接口：新浪财经
-    print("  东方财富接口失败，尝试新浪财经备用接口...")
+    print("  东方财富接口失败，使用新浪财经备用接口...")
     df2 = retry(ak.stock_zh_a_spot, max_attempts=3, delay=5)
     if df2 is not None and not df2.empty:
         print(f"  新浪财经接口成功，获取 {len(df2)} 条")
-        # 新浪接口字段名可能不同，做兼容处理
         name_col = '名称' if '名称' in df2.columns else 'name'
         code_col = '代码' if '代码' in df2.columns else 'code'
         df2 = df2[~df2[name_col].astype(str).str.contains('ST|退', na=False)]
@@ -63,32 +70,48 @@ def save_stock_basic(code, name):
     except Exception as e:
         print(f"保存股票信息失败 {code}: {e}")
 
-def _fetch_kline_raw(code):
-    return ak.stock_zh_a_hist(
-        symbol=code, period="daily",
-        start_date=(datetime.now() - timedelta(days=180)).strftime("%Y%m%d"),
-        end_date=datetime.now().strftime("%Y%m%d"), adjust="qfq"
-    )
+def _fetch_kline_sina(code):
+    sina_symbol = get_sina_symbol(code)
+    start = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
+    end = datetime.now().strftime("%Y%m%d")
+    return ak.stock_zh_a_daily(symbol=sina_symbol, start_date=start, end_date=end, adjust="qfq")
 
 def fetch_and_save_kline(code):
-    """抓取单只股票最近日线数据，带重试"""
-    df = retry(_fetch_kline_raw, max_attempts=2, delay=2, code=code)
+    """用新浪接口抓K线，带重试"""
+    df = retry(_fetch_kline_sina, max_attempts=2, delay=2, code=code)
     if df is None or df.empty:
         return None
 
     try:
-        df = df.rename(columns={
-            '日期': 'trade_date', '开盘': 'open', '最高': 'high',
-            '最低': 'low', '收盘': 'close', '成交量': 'volume',
-            '成交额': 'amount', '换手率': 'turnover_rate', '涨跌幅': 'change_pct'
-        })
+        df = df.reset_index()
+        # 新浪字段：date, open, high, low, close, volume, outstanding_share, turnover
+        df = df.rename(columns={'date': 'trade_date'})
+        for col in ['open', 'high', 'low', 'close', 'volume']:
+            if col not in df.columns:
+                return None
+
+        df['close'] = df['close'].astype(float)
+        df['change_pct'] = df['close'].pct_change() * 100
+        df['amount'] = df['close'] * df['volume']
+        df['turnover_rate'] = df['turnover'] * 100 if 'turnover' in df.columns else None
+
+        df = df.dropna(subset=['change_pct'])
+        if df.empty:
+            return None
+
         records = df.tail(60).to_dict('records')
         for r in records:
             r['code'] = code
-            r['trade_date'] = str(r['trade_date'])
+            r['trade_date'] = str(r['trade_date'])[:10]
+            keep = ['code', 'trade_date', 'open', 'high', 'low', 'close',
+                    'volume', 'amount', 'turnover_rate', 'change_pct']
+            for k in list(r.keys()):
+                if k not in keep:
+                    del r[k]
             for k, v in r.items():
                 if pd.isna(v):
                     r[k] = None
+
         supabase.table('daily_kline').upsert(records).execute()
         return df
     except Exception as e:
@@ -206,3 +229,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
