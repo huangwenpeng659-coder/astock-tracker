@@ -26,5 +26,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          STOCK_POOL_MODE: indices
+          STOCK_POOL_INDICES: "000300"
         run: |
           python scripts/fetch_daily.py
