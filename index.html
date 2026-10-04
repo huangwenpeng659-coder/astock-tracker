@@ -94,6 +94,7 @@ const VIEWS = [
   {id:'radar',name:'机会雷达',icon:'🎯'},
   {id:'analysis',name:'个股分析',icon:'📈'},
   {id:'review',name:'数据总览',icon:'📊'},
+  {id:'settings',name:'选股设置',icon:'⚙️'},
 ];
 
 async function loadCandidates(){
@@ -229,6 +230,66 @@ function selectStock(code){
   selectedStock = candidates.find(c=>c.code===code)||null;
 }
 
+const CONFIG_FIELDS = [
+  {key:'min_change_pct',label:'启动涨幅阈值(%)',options:[{v:3,l:'3% (宽松)'},{v:5,l:'5% (适中)'},{v:7,l:'7% (默认)'},{v:9,l:'9% (严格)'}],def:7},
+  {key:'volume_ratio',label:'量能倍数',options:[{v:1.5,l:'1.5倍'},{v:2,l:'2倍 (默认)'},{v:3,l:'3倍'}],def:2},
+  {key:'shrink_ratio',label:'缩量比例',options:[{v:0.8,l:'80% (宽松)'},{v:0.6,l:'60% (默认)'},{v:0.5,l:'50% (严格)'}],def:0.6},
+  {key:'pullback_tolerance',label:'回踩容忍度',options:[{v:0.95,l:'跌5% (宽松)'},{v:0.97,l:'跌3% (适中)'},{v:0.99,l:'跌1% (默认)'}],def:0.99},
+  {key:'ma5_deviation',label:'MA5偏离度',options:[{v:0.08,l:'8% (宽松)'},{v:0.05,l:'5% (适中)'},{v:0.03,l:'3% (默认)'}],def:0.03},
+  {key:'min_score',label:'最低入选分数',options:[{v:30,l:'30分'},{v:40,l:'40分'},{v:50,l:'50分'},{v:60,l:'60分 (默认)'},{v:70,l:'70分'}],def:60},
+];
+let currentConfig = {};
+
+async function loadConfig(){
+  try{
+    const {data}=await sb.from('config').select('*').eq('key','thresholds');
+    if(data&&data[0]&&data[0].value){
+      const val=typeof data[0].value==='string'?JSON.parse(data[0].value):data[0].value;
+      return val;
+    }
+    return {};
+  }catch(e){return {};}
+}
+
+async function saveConfig(){
+  const cfg={};
+  CONFIG_FIELDS.forEach(f=>{
+    const el=document.getElementById('cfg_'+f.key);
+    cfg[f.key]=el?parseFloat(el.value):f.def;
+  });
+  try{
+    await sb.from('config').upsert({key:'thresholds',value:cfg},{onConflict:'key'}).select();
+    currentConfig=cfg;
+    document.getElementById('save-msg').textContent='保存成功！下次选股将使用新参数';
+    document.getElementById('save-msg').style.color='var(--brand)';
+    setTimeout(()=>{const m=document.getElementById('save-msg');if(m)m.textContent='';},3000);
+  }catch(e){
+    document.getElementById('save-msg').textContent='保存失败: '+e.message;
+    document.getElementById('save-msg').style.color='var(--up)';
+  }
+}
+
+function renderSettings(){
+  const fields=CONFIG_FIELDS.map(f=>{
+    const cur=currentConfig[f.key]!=null?currentConfig[f.key]:f.def;
+    const opts=f.options.map(o=>`<option value="${o.v}" ${Number(cur)===Number(o.v)?'selected':''}>${o.l}</option>`).join('');
+    return `<div class="row" style="flex-direction:column;align-items:stretch;gap:6px">
+      <span class="sub" style="font-size:13px">${f.label}</span>
+      <select id="cfg_${f.key}" style="background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-size:14px;outline:none">${opts}</select>
+    </div>`;
+  }).join('');
+  return `
+    <div class="card">
+      <div class="card-title"><div class="t"><span class="dot"></span>选股参数配置</div><span class="sub">调整后下次选股生效</span></div>
+      ${fields}
+      <div style="margin-top:14px;display:flex;gap:10px;align-items:center">
+        <button onclick="saveConfig()" style="background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;border:none;border-radius:10px;padding:10px 24px;font-size:14px;font-weight:600;cursor:pointer">保存配置</button>
+        <span id="save-msg" style="font-size:12px"></span>
+      </div>
+    </div>
+    <div class="notice">修改参数后需手动触发 GitHub Actions 或等待每日自动运行<br>参数越宽松，候选股票越多，但信号质量可能降低</div>`;
+}
+
 async function render(){
   document.querySelectorAll('#tabs .tab').forEach(t=>t.classList.toggle('active',t.dataset.id===cur));
   document.querySelectorAll('#tabbar div').forEach(t=>t.classList.toggle('active',t.dataset.id===cur));
@@ -236,6 +297,7 @@ async function render(){
   if(cur==='radar') v.innerHTML = renderRadar();
   else if(cur==='analysis'){ v.innerHTML = renderAnalysis(); setTimeout(initKline,50); }
   else if(cur==='review') v.innerHTML = renderReview();
+  else if(cur==='settings') v.innerHTML = renderSettings();
   window.scrollTo(0,0);
 }
 function go(id){ cur=id; render(); }
@@ -246,6 +308,7 @@ async function init(){
   function tick(){document.getElementById('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}).slice(5,16);}
   setInterval(tick,1000);tick();
   document.getElementById('view').innerHTML='<div class="loading">正在加载数据...</div>';
+  currentConfig = await loadConfig();
   candidates = await loadCandidates();
   if(candidates.length) selectedStock = candidates[0];
   render();
