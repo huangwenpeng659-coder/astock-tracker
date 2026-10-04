@@ -106,9 +106,9 @@ def fetch_and_save_kline(code):
         df['open'] = df['open'].astype(float)
         df['high'] = df['high'].astype(float)
         df['low'] = df['low'].astype(float)
-        df['volume'] = df['volume'].astype(float)
+        df['volume'] = df['volume'].astype(float).astype(int)
         df['change_pct'] = df['close'].pct_change() * 100
-        df['amount'] = df['close'] * df['volume']
+        df['amount'] = (df['close'] * df['volume']).astype(int)
         df['turnover_rate'] = (df['turnover'] * 100) if 'turnover' in df.columns else None
 
         df = df.dropna(subset=['change_pct']).reset_index(drop=True)
