@@ -150,7 +150,7 @@ def save_stock_basic(code, name):
         supabase.table('stocks').upsert({
             'code': code, 'name': name,
             'is_st': False, 'is_delisted': False
-        }).execute()
+        }, on_conflict='code').execute()
     except Exception as e:
         print(f"保存股票信息失败 {code}: {e}")
 
@@ -204,7 +204,7 @@ def fetch_and_save_kline(code):
                 if pd.isna(v):
                     r[k] = None
 
-        supabase.table('daily_kline').upsert(rows).execute()
+        supabase.table('daily_kline').upsert(rows, on_conflict='code,trade_date').execute()
         return df
     except Exception as e:
         print(f"保存 {code} K线失败: {e}")
@@ -304,7 +304,7 @@ def save_candidate(code, name, trade_date, score, last_price, launch_point, sign
             'target_2': round(last_price * 1.10, 2),
             'target_3': round(last_price * 1.15, 2),
             'signals': json.dumps(signals, ensure_ascii=False)
-        }).execute()
+        }, on_conflict='code,trade_date').execute()
     except Exception as e:
         print(f"保存候选失败 {code}: {e}")
 
