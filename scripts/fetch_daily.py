@@ -213,7 +213,33 @@ def fetch_and_save_kline(code):
 
 # ============ 选股逻辑 ============
 
-def detect_launch_pattern(df):
+DEFAULT_PARAMS = {
+    'min_change_pct': 7,
+    'volume_ratio': 2.0,
+    'shrink_ratio': 0.6,
+    'pullback_tolerance': 0.99,
+    'ma5_deviation': 0.03,
+    'min_score': 60,
+}
+
+def load_config():
+    try:
+        resp = supabase.table('config').select('*').eq('key','thresholds').execute()
+        params = dict(DEFAULT_PARAMS)
+        if resp.data and resp.data[0].get('value'):
+            val = resp.data[0]['value']
+            if isinstance(val, str):
+                val = json.loads(val)
+            for k in params:
+                if k in val:
+                    params[k] = type(DEFAULT_PARAMS[k])(val[k])
+        print(f"选股参数: {params}")
+        return params
+    except Exception as e:
+        print(f"读取config失败，使用默认参数: {e}")
+        return dict(DEFAULT_PARAMS)
+
+def detect_launch_pattern(df, params):
     if len(df) < 20:
         return None
     df = df.reset_index(drop=True)
@@ -225,7 +251,7 @@ def detect_launch_pattern(df):
     for i in range(len(recent) - 1, -1, -1):
         row = recent.iloc[i]
         vol_mean20 = df['volume'].tail(20).mean()
-        if row['change_pct'] > 9 or (row['change_pct'] > 7 and row['volume'] > vol_mean20 * 2):
+        if row['change_pct'] > 9 or (row['change_pct'] > params['min_change_pct'] and row['volume'] > vol_mean20 * params['volume_ratio']):
             launch_idx = i
             launch_row = row
             break
@@ -236,13 +262,13 @@ def detect_launch_pattern(df):
     if len(after_launch) < 2:
         return None
     avg_vol_after = after_launch['volume'].mean()
-    if avg_vol_after > launch_row['volume'] * 0.6:
+    if avg_vol_after > launch_row['volume'] * params['shrink_ratio']:
         return None
-    if after_launch['low'].min() < launch_point * 0.99:
+    if after_launch['low'].min() < launch_point * params['pullback_tolerance']:
         return None
     last_close = df.iloc[-1]['close']
     last_ma5 = df.iloc[-1]['ma5']
-    if pd.isna(last_ma5) or abs(last_close - last_ma5) / last_ma5 > 0.03:
+    if pd.isna(last_ma5) or abs(last_close - last_ma5) / last_ma5 > params['ma5_deviation']:
         return None
     return {
         'launch_date': str(launch_row['trade_date']),
@@ -286,6 +312,7 @@ def save_candidate(code, name, trade_date, score, last_price, launch_point, sign
 # ============ 主函数 ============
 
 def main():
+    params = load_config()
     stock_pool = get_dynamic_stock_pool()
     print(f"开始抓取 A股数据（共{len(stock_pool)}只）...")
     today = datetime.now().strftime("%Y-%m-%d")
@@ -301,10 +328,10 @@ def main():
             continue
         success_count += 1
 
-        pattern = detect_launch_pattern(df)
+        pattern = detect_launch_pattern(df, params)
         if pattern:
             score, details = calc_scores(df, pattern)
-            if score > 60:
+            if score > params['min_score']:
                 candidates.append({'code': code, 'name': name, 'score': score})
                 save_candidate(code, name, today, score, pattern['last_price'], pattern['launch_point'], details)
                 print(f"发现候选: {name}({code}) 分数:{score:.1f}")
