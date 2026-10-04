@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <title>A股埋伏追踪终端</title>
 <script src="https://cdn.staticfile.org/echarts/5.4.3/echarts.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 :root{
@@ -21,7 +22,7 @@ header{padding:14px 16px 10px;display:flex;align-items:center;justify-content:sp
 .tabs{display:flex;gap:6px;overflow-x:auto;padding:10px 12px;position:sticky;top:56px;z-index:9;
   background:rgba(10,14,23,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--border);scrollbar-width:none}
 .tabs::-webkit-scrollbar{display:none}
-.tab{padding:7px 14px;border-radius:20px;background:var(--card);color:var(--sub);white-space:nowrap;font-size:13px;border:1px solid transparent;transition:.2s}
+.tab{padding:7px 14px;border-radius:20px;background:var(--card);color:var(--sub);white-space:nowrap;font-size:13px;border:1px solid transparent;transition:.2s;cursor:pointer}
 .tab.active{background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;border-color:#3b82f6}
 main{padding:12px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px;margin-bottom:12px}
@@ -52,21 +53,17 @@ main{padding:12px}
 .plan span{font-size:11px;padding:3px 8px;border-radius:6px;background:var(--card2);color:var(--sub)}
 .plan span b{font-weight:600}
 #kline{width:100%;height:260px}
-.mini{height:70px;margin-top:8px}
 .stat-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
 .stat{background:var(--card2);border-radius:10px;padding:10px;text-align:center}
 .stat .v{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
 .stat .l{font-size:11px;color:var(--sub);margin-top:3px}
 .tabbar{position:fixed;bottom:0;left:0;right:0;background:rgba(13,18,30,.96);backdrop-filter:blur(12px);
   border-top:1px solid var(--border);display:flex;padding:6px 0 max(6px,env(safe-area-inset-bottom));z-index:20}
-.tabbar div{flex:1;text-align:center;color:var(--sub);font-size:10px;padding:4px 0}
+.tabbar div{flex:1;text-align:center;color:var(--sub);font-size:10px;padding:4px 0;cursor:pointer}
 .tabbar div.active{color:var(--brand)}
 .tabbar .ic{font-size:19px;display:block;margin-bottom:2px}
 .notice{font-size:11px;color:var(--sub);text-align:center;padding:14px;line-height:1.6}
-.chat{background:var(--card2);border-radius:12px;padding:12px;margin-bottom:10px;line-height:1.7;font-size:13px}
-.chat.me{background:linear-gradient(135deg,#1e3a8a33,#2563eb22);border:1px solid #2563eb44}
-.qtags{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-.qtag{padding:6px 12px;background:var(--card2);border-radius:16px;font-size:12px;color:var(--sub);border:1px solid var(--border)}
+.loading{text-align:center;padding:40px;color:var(--sub)}
 </style>
 </head>
 <body>
@@ -82,295 +79,179 @@ main{padding:12px}
 <nav class="tabbar" id="tabbar"></nav>
 
 <script>
-/* ============ 模拟数据（后续替换为真实数据） ============ */
-const MOCK = {
-  indices:[
-    {n:'上证指数',p:3245.68,c:12.34,pct:0.38},
-    {n:'深证成指',p:10123.45,c:-45.12,pct:-0.44},
-    {n:'创业板指',p:2015.33,c:8.77,pct:0.44},
-    {n:'北证50',p:1012.56,c:-3.21,pct:-0.32},
-  ],
-  candidates:[
-    {code:'002230',name:'科大讯飞',score:92,price:42.15,pct:1.85,launch:40.50,stop:39.29,t1:44.26,t2:46.37,t3:48.47,sig:'启动涨停后缩量回踩企稳，站稳5日线'},
-    {code:'002460',name:'赣锋锂业',score:89,price:35.60,pct:2.31,launch:33.80,stop:32.79,t1:37.38,t2:39.16,t3:40.94,sig:'底部箱体震荡，量能温和放大'},
-    {code:'300059',name:'东方财富',score:87,price:14.28,pct:1.42,launch:13.65,stop:13.24,t1:14.99,t2:15.71,t3:16.42,sig:'缩量回踩不破启动点，MA5上翘'},
-    {code:'002027',name:'分众传媒',score:85,price:6.85,pct:0.88,launch:6.52,stop:6.32,t1:7.19,t2:7.54,t3:7.88,sig:'资金持续流入，筹码集中度提升'},
-    {code:'600570',name:'恒生电子',score:83,price:26.40,pct:-0.75,launch:25.80,stop:25.03,t1:27.72,t2:29.04,t3:30.36,sig:'启动阳线后横盘洗盘，缩量明显'},
-    {code:'002466',name:'天齐锂业',score:81,price:38.90,pct:1.12,launch:37.20,stop:36.08,t1:40.85,t2:42.79,t3:44.74,sig:'相对强度跑赢板块，低位企稳'},
-    {code:'300124',name:'汇川技术',score:79,price:58.30,pct:0.65,launch:56.10,stop:54.42,t1:61.22,t2:64.13,t3:67.05,sig:'布林带收口，波动率处于低位'},
-    {code:'002241',name:'歌尔股份',score:77,price:21.50,pct:-1.24,launch:20.90,stop:20.27,t1:22.58,t2:23.65,t3:24.73,sig:'缩量回踩确认，等待放量突破'},
-  ],
-  tracking:[
-    {code:'002230',name:'科大讯飞',entry:40.80,cur:42.15,stop:39.29,target:44.88,days:5,status:'持仓中'},
-    {code:'300059',name:'东方财富',entry:13.80,cur:14.28,stop:13.24,target:15.18,days:8,status:'持仓中'},
-    {code:'002027',name:'分众传媒',entry:6.60,cur:6.85,stop:6.32,target:7.26,days:12,status:'持仓中'},
-    {code:'600570',name:'恒生电子',entry:26.00,cur:25.40,stop:25.03,target:28.60,days:15,status:'预警'},
-  ],
-  review:{total:86,win:59,winRate:68.6,avgPnl:2.14,avgWin:6.8,avgLoss:-3.2,pf:2.3,maxDD:-6.4}
-};
+const SUPABASE_URL = 'https://iysjcbrximwjpzprixgp.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_LpBmLforAdtG7CWW2e9BbQ_WgV7SsyW';
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-/* ============ 视图定义 ============ */
-const VIEWS = [
-  {id:'market',name:'市场总览',icon:'🏠'},
-  {id:'radar',name:'机会雷达',icon:'🎯'},
-  {id:'analysis',name:'个股分析',icon:'📈'},
-  {id:'tracking',name:'追踪列表',icon:'⭐'},
-  {id:'review',name:'复盘中心',icon:'📊'},
-  {id:'ai',name:'AI助手',icon:'🤖'},
-];
-
-let cur = 'market';
+let cur = 'radar';
 let klineChart = null;
+let candidates = [];
+let selectedStock = null;
 
 function fmt(v,d=2){return Number(v).toFixed(d)}
 
-/* ============ 渲染：市场总览 ============ */
-function renderMarket(){
-  const idx = MOCK.indices.map(i=>`
-    <div class="idx">
-      <div class="n">${i.n}</div>
-      <div class="p ${i.pct>=0?'up':'down'}">${fmt(i.p)}</div>
-      <div class="c ${i.pct>=0?'up':'down'}">${i.pct>=0?'+':''}${fmt(i.c)} ${i.pct>=0?'+':''}${fmt(i.pct)}%</div>
-    </div>`).join('');
+const VIEWS = [
+  {id:'radar',name:'机会雷达',icon:'🎯'},
+  {id:'analysis',name:'个股分析',icon:'📈'},
+  {id:'review',name:'数据总览',icon:'📊'},
+];
 
-  return `
-    <div class="card">
-      <div class="card-title"><div class="t"><span class="dot"></span>市场总览</div><span class="sub">一览即明</span></div>
-      <div class="grid2">${idx}</div>
-    </div>
-
-    <div class="card">
-      <div class="card-title"><div class="t"><span class="dot"></span>市场状态</div></div>
-      <div class="stat-grid">
-        <div class="stat"><div class="v up">上涨</div><div class="l">整体趋势</div></div>
-        <div class="stat"><div class="v" style="color:var(--gold)">68%</div><div class="l">上涨占比</div></div>
-        <div class="stat"><div class="v">342/158</div><div class="l">涨跌家数</div></div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title"><div class="t"><span class="dot"></span>今日机会雷达</div><span class="badge buy">8只候选</span></div>
-      ${MOCK.candidates.slice(0,3).map((c,i)=>`
-        <div class="row" onclick="go('analysis')">
-          <div style="display:flex;align-items:center;gap:10px">
-            <div class="rank ${i===0?'top':''}">${i+1}</div>
-            <div><div class="stock-name">${c.name}</div><div class="stock-code">${c.code}</div></div>
-          </div>
-          <div style="text-align:right">
-            <div class="${c.pct>=0?'up':'down'}" style="font-weight:600">${fmt(c.price)}</div>
-            <div class="${c.pct>=0?'up':'down'}" style="font-size:12px">${c.pct>=0?'+':''}${fmt(c.pct)}%</div>
-          </div>
-        </div>`).join('')}
-    </div>
-    <div class="notice">⚠️ 本工具仅供历史数据研究，不构成投资建议</div>
-  `;
+async function loadCandidates(){
+  const today = new Date().toISOString().slice(0,10);
+  const {data,error} = await sb.from('candidates')
+    .select('*')
+    .order('score',{ascending:false})
+    .limit(20);
+  if(error){console.error('加载候选失败:',error);return [];}
+  return data||[];
 }
 
-/* ============ 渲染：机会雷达 ============ */
+async function loadKline(code){
+  const {data,error} = await sb.from('daily_kline')
+    .select('*')
+    .eq('code',code)
+    .order('trade_date',{ascending:true})
+    .limit(60);
+  if(error){console.error('加载K线失败:',error);return [];}
+  return data||[];
+}
+
 function renderRadar(){
-  const items = MOCK.candidates.map((c,i)=>`
-    <div class="card" onclick="go('analysis')">
+  if(!candidates.length) return `<div class="loading">暂无候选股票数据<br><span class="sub">等待交易日选股脚本运行后刷新</span></div>`;
+  const items = candidates.map((c,i)=>{
+    const pct = c.last_price && c.launch_point ? ((c.last_price-c.launch_point)/c.launch_point*100) : 0;
+    return `
+    <div class="card" onclick="selectStock('${c.code}');go('analysis')" style="cursor:pointer">
       <div style="display:flex;align-items:center;justify-content:space-between">
         <div style="display:flex;align-items:center;gap:10px">
           <div class="rank ${i<3?'top':''}">${i+1}</div>
           <div>
-            <div class="stock-name">${c.name} <span class="badge buy">埋伏</span></div>
-            <div class="stock-code">${c.code} · ${c.sig}</div>
+            <div class="stock-name">${c.code} <span class="badge buy">埋伏</span></div>
+            <div class="stock-code">入场 ${fmt(c.launch_point)} · 止损 ${fmt(c.stop_loss)}</div>
           </div>
         </div>
         <div style="text-align:center">
-          <div class="score">${c.score}</div>
+          <div class="score">${fmt(c.score,0)}</div>
           <div class="score-l">质量分</div>
         </div>
       </div>
-      <div class="progress"><i style="width:${c.score}%"></i></div>
+      <div class="progress"><i style="width:${Math.min(c.score,100)}%"></i></div>
       <div class="plan">
-        <span>现价 <b class="up">${fmt(c.price)}</b></span>
-        <span>入场 <b>${fmt(c.launch)}</b></span>
-        <span>止损 <b class="down">${fmt(c.stop)}</b></span>
-        <span>目标 <b class="up">${fmt(c.t2)}</b></span>
+        <span>现价 <b class="${pct>=0?'up':'down'}">${fmt(c.last_price)}</b></span>
+        <span>目标1 <b class="up">${fmt(c.target_1)}</b></span>
+        <span>目标2 <b class="up">${fmt(c.target_2)}</b></span>
+        <span>目标3 <b class="up">${fmt(c.target_3)}</b></span>
       </div>
-    </div>`).join('');
-  return `<div class="card-title" style="padding:4px 4px 12px"><div class="t"><span class="dot"></span>机会雷达 · Top 8</div><span class="sub">启动形态确认</span></div>${items}`;
+    </div>`;}).join('');
+  return `<div class="card-title" style="padding:4px 4px 12px"><div class="t"><span class="dot"></span>机会雷达 · Top ${candidates.length}</div><span class="sub">启动形态确认</span></div>${items}
+  <div class="notice">⚠️ 本工具仅供历史数据研究，不构成投资建议</div>`;
 }
 
-/* ============ 渲染：个股分析（K线） ============ */
-function genKline(base,days){
-  const data=[]; let p=base*0.85;
-  for(let i=0;i<days;i++){
-    const o=p, c=o*(1+(Math.random()-0.48)*0.03);
-    const h=Math.max(o,c)*(1+Math.random()*0.015);
-    const l=Math.min(o,c)*(1-Math.random()*0.015);
-    data.push([+o.toFixed(2),+c.toFixed(2),+l.toFixed(2),+h.toFixed(2)]);
-    p=c;
-  }
-  // 末尾来一根涨停
-  const last=data[data.length-1][1];
-  data.push([last,+ (last*1.1).toFixed(2),last,+(last*1.1).toFixed(2)]);
-  return data;
-}
 function renderAnalysis(){
-  const c = MOCK.candidates[0];
+  const c = selectedStock || candidates[0];
+  if(!c) return `<div class="loading">请先从机会雷达选择一只股票</div>`;
   return `
     <div class="card">
       <div class="card-title">
-        <div class="t"><span class="dot"></span>${c.name} <span class="stock-code">${c.code}</span></div>
+        <div class="t"><span class="dot"></span>${c.code}</div>
         <span class="badge buy">埋伏信号</span>
       </div>
       <div style="display:flex;justify-content:space-between;margin-bottom:10px">
-        <div class="up" style="font-size:26px;font-weight:700">${fmt(c.price)} <span style="font-size:14px">+${fmt(c.pct)}%</span></div>
-        <div style="text-align:right"><div class="score">${c.score}</div><div class="score-l">质量分</div></div>
+        <div class="up" style="font-size:26px;font-weight:700">${fmt(c.last_price)}</div>
+        <div style="text-align:right"><div class="score">${fmt(c.score,0)}</div><div class="score-l">质量分</div></div>
       </div>
       <div id="kline"></div>
     </div>
-
     <div class="card">
       <div class="card-title"><div class="t"><span class="dot"></span>交易计划</div></div>
-      <div class="row"><span class="sub">入场区间</span><b>${fmt(c.launch)} ~ ${fmt(c.launch*1.02)}</b></div>
-      <div class="row"><span class="sub">止损位（启动点下方）</span><b class="down">${fmt(c.stop)}</b></div>
-      <div class="row"><span class="sub">目标位1 (+5%)</span><b class="up">${fmt(c.t1)}</b></div>
-      <div class="row"><span class="sub">目标位2 (+10%)</span><b class="up">${fmt(c.t2)}</b></div>
-      <div class="row"><span class="sub">目标位3 (+15%)</span><b class="up">${fmt(c.t3)}</b></div>
-      <div class="row"><span class="sub">风险收益比</span><b style="color:var(--gold)">2.5 : 1</b></div>
-    </div>
-
-    <div class="card">
-      <div class="card-title"><div class="t"><span class="dot"></span>入选逻辑</div></div>
-      <div class="chat">${c.sig}<br><br>
-      ✅ 价格处于近2年低位区间<br>
-      ✅ 20日波动率收窄至历史低位<br>
-      ✅ 启动涨停后缩量回踩，未跌破启动点<br>
-      ✅ 当前站稳5日线上方</div>
+      <div class="row"><span class="sub">入场点</span><b>${fmt(c.launch_point)}</b></div>
+      <div class="row"><span class="sub">止损位</span><b class="down">${fmt(c.stop_loss)}</b></div>
+      <div class="row"><span class="sub">目标位1 (+5%)</span><b class="up">${fmt(c.target_1)}</b></div>
+      <div class="row"><span class="sub">目标位2 (+10%)</span><b class="up">${fmt(c.target_2)}</b></div>
+      <div class="row"><span class="sub">目标位3 (+15%)</span><b class="up">${fmt(c.target_3)}</b></div>
     </div>`;
 }
-function initKline(){
+
+async function initKline(){
+  const c = selectedStock || candidates[0];
+  if(!c) return;
   const el = document.getElementById('kline');
-  if(!el || !window.echarts) return;
+  if(!el||!window.echarts) return;
   if(klineChart){klineChart.dispose();}
   klineChart = echarts.init(el);
-  const data = genKline(42, 60);
+  klineChart.showLoading({text:'加载K线...',color:'#3b82f6',textColor:'#7c8db5',maskColor:'rgba(10,14,23,0.8)'});
+  const kdata = await loadKline(c.code);
+  klineChart.hideLoading();
+  if(!kdata.length){klineChart.setOption({title:{text:'暂无K线数据',left:'center',top:'center',textStyle:{color:'#7c8db5',fontSize:13}}});return;}
+  const dates = kdata.map(k=>k.trade_date.slice(5));
+  const ohlc = kdata.map(k=>[k.open,k.close,k.low,k.high]);
   klineChart.setOption({
     backgroundColor:'transparent',
     grid:{left:40,right:12,top:16,bottom:44},
-    xAxis:{type:'category',data:data.map((_,i)=>'D'+(i+1)),axisLine:{lineStyle:{color:'#1e2a42'}},axisLabel:{color:'#7c8db5',fontSize:10,interval:9}},
+    xAxis:{type:'category',data:dates,axisLine:{lineStyle:{color:'#1e2a42'}},axisLabel:{color:'#7c8db5',fontSize:10,interval: Math.floor(dates.length/6)}},
     yAxis:{scale:true,axisLine:{lineStyle:{color:'#1e2a42'}},axisLabel:{color:'#7c8db5',fontSize:10},splitLine:{lineStyle:{color:'#131a29'}}},
-    dataZoom:[{type:'inside',xAxisIndex:0,start:50,end:100}],
-    series:[{
-      type:'candlestick',data:data,
-      itemStyle:{color:'#ef4444',color0:'#22c55e',borderColor:'#ef4444',borderColor0:'#22c55e'}
-    }]
+    dataZoom:[{type:'inside',xAxisIndex:0,start:30,end:100}],
+    series:[{type:'candlestick',data:ohlc,itemStyle:{color:'#ef4444',color0:'#22c55e',borderColor:'#ef4444',borderColor0:'#22c55e'}}]
   });
 }
 
-/* ============ 渲染：追踪列表 ============ */
-function renderTracking(){
-  const items = MOCK.tracking.map(t=>{
-    const pnl = ((t.cur-t.entry)/t.entry*100);
-    const toStop = ((t.cur-t.stop)/t.cur*100);
-    const toTarget = ((t.target-t.cur)/t.cur*100);
-    const warn = t.status==='预警';
-    return `
-    <div class="card" style="${warn?'border-color:var(--gold)':''}">
-      <div style="display:flex;justify-content:space-between;align-items:center">
-        <div>
-          <div class="stock-name">${t.name} <span class="stock-code">${t.code}</span></div>
-          <div class="stock-code">持仓 ${t.days} 天</div>
-        </div>
-        <span class="badge ${warn?'risk':'buy'}">${t.status}</span>
-      </div>
-      <div class="stat-grid" style="margin-top:10px">
-        <div class="stat"><div class="v ${pnl>=0?'up':'down'}">${pnl>=0?'+':''}${fmt(pnl)}%</div><div class="l">浮动盈亏</div></div>
-        <div class="stat"><div class="v down">${fmt(toStop)}%</div><div class="l">距止损</div></div>
-        <div class="stat"><div class="v up">${fmt(toTarget)}%</div><div class="l">距目标</div></div>
-      </div>
-    </div>`;}).join('');
-  return `<div class="card-title" style="padding:4px 4px 12px"><div class="t"><span class="dot"></span>追踪列表</div><span class="sub">${MOCK.tracking.length}只持仓</span></div>${items}
-  <div class="notice">跌破启动点将自动剔除 · 达到目标位自动归档</div>`;
-}
-
-/* ============ 渲染：复盘中心 ============ */
 function renderReview(){
-  const r = MOCK.review;
+  const total = candidates.length;
+  const avgScore = total ? (candidates.reduce((s,c)=>s+c.score,0)/total) : 0;
+  const high = candidates.filter(c=>c.score>=80).length;
   return `
     <div class="card">
-      <div class="card-title"><div class="t"><span class="dot"></span>策略表现统计</div><span class="sub">近90天</span></div>
+      <div class="card-title"><div class="t"><span class="dot"></span>选股数据总览</div><span class="sub">最新一期</span></div>
       <div class="stat-grid">
-        <div class="stat"><div class="v">${r.total}</div><div class="l">总交易次数</div></div>
-        <div class="stat"><div class="v up">${r.winRate}%</div><div class="l">胜率</div></div>
-        <div class="stat"><div class="v up">+${r.avgPnl}%</div><div class="l">平均收益</div></div>
-      </div>
-      <div class="stat-grid" style="margin-top:8px">
-        <div class="stat"><div class="v" style="color:var(--gold)">${r.pf}</div><div class="l">盈亏比</div></div>
-        <div class="stat"><div class="v up">+${r.avgWin}%</div><div class="l">平均盈利</div></div>
-        <div class="stat"><div class="v down">${r.avgLoss}%</div><div class="l">平均亏损</div></div>
+        <div class="stat"><div class="v">${total}</div><div class="l">候选股票数</div></div>
+        <div class="stat"><div class="v" style="color:var(--gold)">${fmt(avgScore,1)}</div><div class="l">平均质量分</div></div>
+        <div class="stat"><div class="v up">${high}</div><div class="l">高分(≥80)</div></div>
       </div>
     </div>
-
     <div class="card">
-      <div class="card-title"><div class="t"><span class="dot"></span>规则有效性分析</div></div>
-      <div class="chat">
-        📌 <b>核心发现</b><br>
-        · 启动形态确认后入场的胜率显著高于单纯低位横盘<br>
-        · 平均持有 <b>12 天</b>达到目标位<br>
-        · 时间止损（30天）有效规避了"死水"票<br><br>
-        ⚠️ 期望值 = 68.6% × 6.8% - 31.4% × 3.2% ≈ <b>+3.66%</b>（正期望）
-      </div>
+      <div class="card-title"><div class="t"><span class="dot"></span>候选列表</div></div>
+      ${candidates.map((c,i)=>`
+        <div class="row" onclick="selectStock('${c.code}');go('analysis')" style="cursor:pointer">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div class="rank ${i<3?'top':''}">${i+1}</div>
+            <div><div class="stock-name">${c.code}</div><div class="stock-code">入场${fmt(c.launch_point)} 止损${fmt(c.stop_loss)}</div></div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-weight:600">${fmt(c.last_price)}</div>
+            <div class="score" style="font-size:14px">${fmt(c.score,0)}分</div>
+          </div>
+        </div>`).join('')}
     </div>
-    <div class="notice">统计基于历史回测，不代表未来表现</div>`;
+    <div class="notice">⚠️ 数据来源于每日自动选股，仅供研究参考</div>`;
 }
 
-/* ============ 渲染：AI助手 ============ */
-function renderAI(){
-  return `
-    <div class="card">
-      <div class="card-title"><div class="t"><span class="dot"></span>AI 助手</div><span class="badge watch">GLM-4</span></div>
-      <div class="chat me">今天有哪些票接近企稳信号？</div>
-      <div class="chat">
-      📊 根据今日扫描结果，有 <b>3 只</b>接近企稳确认：<br><br>
-      · <b>科大讯飞(002230)</b> — 启动涨停后缩量回踩第5天，站稳5日线，质量分92<br>
-      · <b>东方财富(300059)</b> — 缩量不破启动点，MA5开始上翘，质量分87<br>
-      · <b>恒生电子(600570)</b> — 横盘洗盘缩量明显，等待放量突破<br><br>
-      建议重点关注前两只，止损均设在启动点下方 3%。
-      </div>
-      <div class="chat me">为什么江西某票被剔除了？</div>
-      <div class="chat">
-      🔍 该票于入选后第3个交易日 <b>跌破启动点</b>，触发"洗盘逻辑失效"规则，已自动剔除。<br><br>
-      跌破启动点意味着主力未在此位置护盘，继续持有的逻辑不成立，这是硬性止损条件。
-      </div>
-    </div>
-    <div class="card">
-      <div class="qtags">
-        <span class="qtag">分析下今日候选</span>
-        <span class="qtag">哪些逼近止损</span>
-        <span class="qtag">总结市场风险</span>
-        <span class="qtag">帮我制定交易计划</span>
-      </div>
-      <div class="sub" style="text-align:center;padding:8px">💡 接入大模型 API 后可实时对话</div>
-    </div>`;
+function selectStock(code){
+  selectedStock = candidates.find(c=>c.code===code)||null;
 }
 
-/* ============ 路由 ============ */
-function render(){
+async function render(){
   document.querySelectorAll('#tabs .tab').forEach(t=>t.classList.toggle('active',t.dataset.id===cur));
   document.querySelectorAll('#tabbar div').forEach(t=>t.classList.toggle('active',t.dataset.id===cur));
   const v = document.getElementById('view');
-  if(cur==='market') v.innerHTML = renderMarket();
-  else if(cur==='radar') v.innerHTML = renderRadar();
+  if(cur==='radar') v.innerHTML = renderRadar();
   else if(cur==='analysis'){ v.innerHTML = renderAnalysis(); setTimeout(initKline,50); }
-  else if(cur==='tracking') v.innerHTML = renderTracking();
   else if(cur==='review') v.innerHTML = renderReview();
-  else if(cur==='ai') v.innerHTML = renderAI();
   window.scrollTo(0,0);
 }
 function go(id){ cur=id; render(); }
 
-/* ============ 初始化 ============ */
-document.getElementById('tabs').innerHTML = VIEWS.map(v=>`<div class="tab" data-id="${v.id}" onclick="go('${v.id}')">${v.name}</div>`).join('');
-document.getElementById('tabbar').innerHTML = VIEWS.map(v=>`<div data-id="${v.id}" onclick="go('${v.id}')"><span class="ic">${v.icon}</span>${v.name}</div>`).join('');
-function tick(){document.getElementById('clock').textContent = new Date().toLocaleString('zh-CN',{hour12:false}).slice(5,16);}
-setInterval(tick,1000);tick();
-render();
-window.addEventListener('resize',()=>klineChart&&klineChart.resize());
+async function init(){
+  document.getElementById('tabs').innerHTML = VIEWS.map(v=>`<div class="tab" data-id="${v.id}" onclick="go('${v.id}')">${v.name}</div>`).join('');
+  document.getElementById('tabbar').innerHTML = VIEWS.map(v=>`<div data-id="${v.id}" onclick="go('${v.id}')"><span class="ic">${v.icon}</span>${v.name}</div>`).join('');
+  function tick(){document.getElementById('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}).slice(5,16);}
+  setInterval(tick,1000);tick();
+  document.getElementById('view').innerHTML='<div class="loading">正在加载数据...</div>';
+  candidates = await loadCandidates();
+  if(candidates.length) selectedStock = candidates[0];
+  render();
+  window.addEventListener('resize',()=>klineChart&&klineChart.resize());
+}
+init();
 </script>
 </body>
 </html>
