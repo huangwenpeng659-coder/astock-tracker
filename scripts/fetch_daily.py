@@ -294,6 +294,153 @@ def calc_scores(df, pattern):
     total = sum(scores[k] * weights[k] for k in weights)
     return total, scores
 
+# ============ 技术分析 ============
+
+def calc_macd(close, fast=12, slow=26, signal=9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    dif = ema_fast - ema_slow
+    dea = dif.ewm(span=signal, adjust=False).mean()
+    return dif, dea, (dif - dea) * 2
+
+def calc_rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss.replace(0, float('nan'))
+    return 100 - 100 / (1 + rs)
+
+def analyze_stock(df):
+    """
+    对单只股票做技术分析，返回评分(0-100)和信号列表
+    维度：趋势 / 动量 / 量能 / 波动率 / 形态
+    """
+    if len(df) < 30:
+        return None, ['数据不足(需至少30天)']
+
+    df = df.reset_index(drop=True).copy()
+    df['ma5'] = df['close'].rolling(5).mean()
+    df['ma10'] = df['close'].rolling(10).mean()
+    df['ma20'] = df['close'].rolling(20).mean()
+    df['ma60'] = df['close'].rolling(60).mean()
+    df['volume'] = df['volume'].astype(float)
+    df['vol_ma5'] = df['volume'].rolling(5).mean()
+    df['vol_ma20'] = df['volume'].rolling(20).mean()
+    dif, dea, macd_hist = calc_macd(df['close'])
+    df['macd_dif'] = dif
+    df['macd_dea'] = dea
+    df['macd_hist'] = macd_hist
+    df['rsi'] = calc_rsi(df['close'])
+    # 布林带
+    df['boll_mid'] = df['close'].rolling(20).mean()
+    df['boll_std'] = df['close'].rolling(20).std()
+    df['boll_upper'] = df['boll_mid'] + 2 * df['boll_std']
+    df['boll_lower'] = df['boll_mid'] - 2 * df['boll_std']
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else last
+    signals = []
+    score = 50  # 基准分
+
+    # --- 1. 趋势 (权重30) ---
+    trend_score = 0
+    if last['close'] > last['ma20']:
+        trend_score += 12; signals.append('✅ 股价站上MA20')
+    else:
+        signals.append('❌ 股价跌破MA20')
+    if last['ma5'] > last['ma10'] > last['ma20']:
+        trend_score += 10; signals.append('✅ 均线多头排列(MA5>MA10>MA20)')
+    elif last['ma5'] < last['ma10'] < last['ma20']:
+        signals.append('⚠️ 均线空头排列')
+    if not pd.isna(last['ma60']):
+        if last['close'] > last['ma60']:
+            trend_score += 8; signals.append('✅ 股价站上MA60(长期趋势向上)')
+        else:
+            signals.append('⚠️ 股价低于MA60')
+    score += trend_score * 0.3
+
+    # --- 2. 动量/MACD (权重20) ---
+    mom_score = 0
+    if not pd.isna(last['macd_dif']):
+        if last['macd_dif'] > last['macd_dea']:
+            mom_score += 10; signals.append('✅ MACD金叉/DIF在DEA上方')
+        else:
+            signals.append('⚠️ MACD死叉/DIF在DEA下方')
+        if last['macd_hist'] > 0 and prev['macd_hist'] <= 0:
+            mom_score += 10; signals.append('🔥 MACD柱由负转正(金叉信号)')
+        elif last['macd_hist'] > prev['macd_hist']:
+            mom_score += 5
+    score += mom_score * 0.2
+
+    # --- 3. RSI (权重15) ---
+    if not pd.isna(last['rsi']):
+        rsi = last['rsi']
+        if rsi < 30:
+            score += 15; signals.append(f'🔥 RSI={rsi:.1f} 超卖(反弹机会)')
+        elif rsi < 45:
+            score += 10; signals.append(f'✅ RSI={rsi:.1f} 偏低(低位区域)')
+        elif rsi < 70:
+            score += 5; signals.append(f'⚖️ RSI={rsi:.1f} 中性')
+        else:
+            signals.append(f'⚠️ RSI={rsi:.1f} 超买(回调风险)')
+
+    # --- 4. 量能 (权重20) ---
+    vol_score = 0
+    if not pd.isna(last['vol_ma5']) and not pd.isna(last['vol_ma20']):
+        vol_ratio = last['vol_ma5'] / last['vol_ma20'] if last['vol_ma20'] > 0 else 1
+        if 0.8 < vol_ratio < 1.5 and last['close'] > last['open']:
+            vol_score += 10; signals.append(f'✅ 温和放量上涨(量比{vol_ratio:.2f})')
+        elif vol_ratio >= 1.5 and last['close'] > last['open']:
+            vol_score += 8; signals.append(f'🔥 明显放量上涨(量比{vol_ratio:.2f})')
+        elif vol_ratio < 0.6:
+            signals.append(f'⚠️ 缩量(量比{vol_ratio:.2f})')
+            vol_score += 3
+        else:
+            vol_score += 5
+        # 量价背离检测
+        recent5 = df.tail(5)
+        price_up = recent5['close'].iloc[-1] > recent5['close'].iloc[0]
+        vol_down = recent5['volume'].mean() < df['volume'].tail(20).mean()
+        if price_up and vol_down:
+            signals.append('⚠️ 量价背离(涨但缩量)')
+            vol_score -= 3
+    score += vol_score * 0.2
+
+    # --- 5. 波动率/位置 (权重15) ---
+    vol_score2 = 0
+    recent_vol = df['close'].tail(20).pct_change().std()
+    if pd.notna(recent_vol):
+        if recent_vol < 0.015:
+            vol_score2 += 8; signals.append('✅ 低波动(可能酝酿方向)')
+        elif recent_vol > 0.04:
+            signals.append(f'⚠️ 高波动(σ={recent_vol:.3f})')
+        else:
+            vol_score2 += 4
+    # 布林带位置
+    boll_width = (last['boll_upper'] - last['boll_lower']) / last['boll_mid'] if last['boll_mid'] > 0 else 0
+    if boll_width < 0.1:
+        vol_score2 += 7; signals.append('🔥 布林带极度收口(即将变盘)')
+    elif boll_width < 0.15:
+        vol_score2 += 4; signals.append('✅ 布林带收口')
+    if last['close'] <= last['boll_lower']:
+        signals.append('🔥 触及布林带下轨(超卖)')
+        vol_score2 += 5
+    score += vol_score2 * 0.15
+
+    score = max(0, min(100, round(score, 1)))
+    grade = '强烈关注' if score >= 75 else '关注' if score >= 60 else '中性' if score >= 45 else '回避'
+    return {'score': score, 'grade': grade, 'signals': signals}, signals
+
+def save_analysis(code, name, trade_date, result):
+    try:
+        supabase.table('stock_scores').upsert({
+            'code': code, 'name': name, 'trade_date': trade_date,
+            'score': result['score'], 'grade': result['grade'],
+            'signals': json.dumps(result['signals'], ensure_ascii=False)
+        }, on_conflict='code,trade_date').execute()
+    except Exception as e:
+        print(f"保存分析失败 {code}: {e}")
+
 def save_candidate(code, name, trade_date, score, last_price, launch_point, signals):
     stop_loss = launch_point * 0.97
     try:
@@ -314,10 +461,33 @@ def save_candidate(code, name, trade_date, score, last_price, launch_point, sign
 
 def main():
     params = load_config()
-    stock_pool = get_dynamic_stock_pool()
-    print(f"开始抓取 A股数据（共{len(stock_pool)}只）...")
     today = datetime.now().strftime("%Y-%m-%d")
 
+    # --- 自选股分析 ---
+    try:
+        wl_resp = supabase.table('watchlist').select('*').execute()
+        watchlist = wl_resp.data or []
+    except Exception as e:
+        print(f"读取自选股失败: {e}")
+        watchlist = []
+
+    if watchlist:
+        print(f"\n===== 分析 {len(watchlist)} 只自选股 =====")
+        for item in watchlist:
+            code = item['code']
+            name = item.get('name', code)
+            df = fetch_and_save_kline(code)
+            if df is None or len(df) < 20:
+                print(f"  {name}({code}) 数据不足，跳过")
+                continue
+            result, _ = analyze_stock(df)
+            if result:
+                save_analysis(code, name, today, result)
+                print(f"  {name}({code}): {result['score']}分 [{result['grade']}]")
+
+    # --- 全池选股 ---
+    stock_pool = get_dynamic_stock_pool()
+    print(f"\n开始抓取 A股数据（共{len(stock_pool)}只）...")
     candidates = []
     success_count = 0
 

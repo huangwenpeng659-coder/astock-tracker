@@ -92,6 +92,7 @@ function fmt(v,d=2){return Number(v).toFixed(d)}
 
 const VIEWS = [
   {id:'radar',name:'机会雷达',icon:'🎯'},
+  {id:'watchlist',name:'自选股',icon:'⭐'},
   {id:'analysis',name:'个股分析',icon:'📈'},
   {id:'review',name:'数据总览',icon:'📊'},
   {id:'settings',name:'选股设置',icon:'⚙️'},
@@ -226,6 +227,102 @@ function renderReview(){
     <div class="notice">⚠️ 数据来源于每日自动选股，仅供研究参考</div>`;
 }
 
+// ============ 自选股 ============
+
+let watchlist = [];
+let watchScores = {};
+
+async function loadWatchlist(){
+  try{
+    const {data}=await sb.from('watchlist').select('*').order('created_at');
+    watchlist=data||[];
+  }catch(e){watchlist=[];}
+  try{
+    const {data}=await sb.from('stock_scores').select('*').order('score',{ascending:false});
+    (data||[]).forEach(s=>{watchScores[s.code]=s;});
+  }catch(e){}
+}
+
+async function addWatchStock(){
+  const inp=document.getElementById('wl-input');
+  const val=(inp?.value||'').trim();
+  if(!val){alert('请输入股票代码或名称');return;}
+  const code=val.replace(/[^0-9]/g,'');
+  if(code.length!==6){alert('请输入6位股票代码');return;}
+  try{
+    const {data:exist}=await sb.from('watchlist').select('code').eq('code',code);
+    if(exist&&exist.length){alert('该股票已在自选股中');return;}
+    let name=val;
+    const {data:stock}=await sb.from('stocks').select('name').eq('code',code);
+    if(stock&&stock.length) name=stock[0].name;
+    await sb.from('watchlist').insert({code,name});
+    await loadWatchlist();
+    go('watchlist');
+  }catch(e){alert('添加失败: '+e.message);}
+}
+
+async function removeWatchStock(code){
+  try{
+    await sb.from('watchlist').delete().eq('code',code);
+    delete watchScores[code];
+    await loadWatchlist();
+    go('watchlist');
+  }catch(e){alert('删除失败: '+e.message);}
+}
+
+function gradeColor(g){
+  if(g==='强烈关注')return 'var(--up)';
+  if(g==='关注')return 'var(--gold)';
+  if(g==='中性')return 'var(--sub)';
+  return 'var(--down)';
+}
+
+function renderWatchlist(){
+  if(!watchlist.length){
+    return `<div class="card">
+      <div class="card-title"><div class="t"><span class="dot"></span>自选股</div></div>
+      <div style="display:flex;gap:8px;margin-top:4px">
+        <input id="wl-input" placeholder="输入6位股票代码，如 600519" style="flex:1;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 14px;font-size:14px;outline:none">
+        <button onclick="addWatchStock()" style="background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;border:none;border-radius:10px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer">添加</button>
+      </div>
+      <div class="loading" style="padding:20px">暂无自选股，添加后每日自动分析评分</div>
+    </div>`;
+  }
+  const items=watchlist.map(w=>{
+    const s=watchScores[w.code];
+    const score=s?s.score:'--';
+    const grade=s?s.grade:'待分析';
+    const sigs=s?JSON.parse(s.signs||'[]'):[];
+    const topSigs=sigs.slice(0,3).map(x=>`<div style="font-size:11px;color:var(--sub);margin-top:2px">${x}</div>`).join('');
+    return `<div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div class="stock-name">${w.name||w.code}</div>
+          <div class="stock-code">${w.code}</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="text-align:center">
+            <div style="font-size:22px;font-weight:700;color:${s?gradeColor(s.grade):'var(--sub)'}">${score}</div>
+            <div style="font-size:10px;color:${s?gradeColor(s.grade):'var(--sub)'}">${grade}</div>
+          </div>
+          <button onclick="removeWatchStock('${w.code}')" style="background:none;border:1px solid var(--border);color:var(--sub);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer">删除</button>
+        </div>
+      </div>
+      ${s?`<div class="progress" style="margin-top:8px"><i style="width:${Math.min(s.score,100)}%"></i></div>`:''}
+      ${topSigs}
+    </div>`;}).join('');
+  return `
+    <div class="card">
+      <div class="card-title"><div class="t"><span class="dot"></span>自选股（${watchlist.length}只）</div></div>
+      <div style="display:flex;gap:8px;margin-top:4px">
+        <input id="wl-input" placeholder="输入6位股票代码，如 600519" style="flex:1;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 14px;font-size:14px;outline:none">
+        <button onclick="addWatchStock()" style="background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;border:none;border-radius:10px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer">添加</button>
+      </div>
+    </div>
+    ${items}
+    <div class="notice">评分每天自动更新 · 点击K线页面查看详细分析</div>`;
+}
+
 function selectStock(code){
   selectedStock = candidates.find(c=>c.code===code)||null;
 }
@@ -295,6 +392,7 @@ async function render(){
   document.querySelectorAll('#tabbar div').forEach(t=>t.classList.toggle('active',t.dataset.id===cur));
   const v = document.getElementById('view');
   if(cur==='radar') v.innerHTML = renderRadar();
+  else if(cur==='watchlist') v.innerHTML = renderWatchlist();
   else if(cur==='analysis'){ v.innerHTML = renderAnalysis(); setTimeout(initKline,50); }
   else if(cur==='review') v.innerHTML = renderReview();
   else if(cur==='settings') v.innerHTML = renderSettings();
@@ -309,6 +407,7 @@ async function init(){
   setInterval(tick,1000);tick();
   document.getElementById('view').innerHTML='<div class="loading">正在加载数据...</div>';
   currentConfig = await loadConfig();
+  await loadWatchlist();
   candidates = await loadCandidates();
   if(candidates.length) selectedStock = candidates[0];
   render();
