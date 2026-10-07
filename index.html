@@ -193,13 +193,44 @@ async function initKline(){
   if(!kdata.length){klineChart.setOption({title:{text:'暂无K线数据',left:'center',top:'center',textStyle:{color:'#7c8db5',fontSize:13}}});return;}
   const dates = kdata.map(k=>k.trade_date.slice(5));
   const ohlc = kdata.map(k=>[k.open,k.close,k.low,k.high]);
+
+  // 交易计划水平线：入场 / 止损 / 目标1-3
+  const planLines = [];
+  const planMarks = [];
+  if(c.launch_point){
+    planLines.push({yAxis:c.launch_point,lineStyle:{color:'#3b82f6',type:'solid',width:1.5},label:{show:true,position:'insideEndTop',formatter:'入场 '+c.launch_point,color:'#3b82f6',fontSize:10}});
+  }
+  if(c.stop_loss){
+    planLines.push({yAxis:c.stop_loss,lineStyle:{color:'#22c55e',type:'dashed',width:1.5},label:{show:true,position:'insideEndTop',formatter:'止损 '+c.stop_loss,color:'#22c55e',fontSize:10}});
+  }
+  [[c.target_1,'#f59e0b','目标1'],[c.target_2,'#f97316','目标2'],[c.target_3,'#ef4444','目标3']].forEach(([v,color,name])=>{
+    if(v) planLines.push({yAxis:v,lineStyle:{color:color,type:'dashed',width:1},label:{show:true,position:'insideEndTop',formatter:name+' '+v,color:color,fontSize:10}});
+  });
+
   klineChart.setOption({
     backgroundColor:'transparent',
-    grid:{left:40,right:12,top:16,bottom:44},
+    grid:{left:52,right:12,top:30,bottom:44},
+    axisPointer:{link:[{xAxisIndex:'all'}],label:{backgroundColor:'#1e3a8a',color:'#e5edff',fontSize:10}},
+    tooltip:{
+      trigger:'axis',
+      axisPointer:{type:'cross',crossStyle:{color:'#7c8db5'},lineStyle:{color:'#7c8db5',type:'dashed'}},
+      backgroundColor:'#131a29',borderColor:'#1e2a42',textStyle:{color:'#e5edff',fontSize:11},
+      formatter:function(params){
+        const k=params.find(p=>p.seriesType==='candlestick');
+        if(!k) return '';
+        const d=k.data;
+        const pct=((d[1]-d[0])/d[0]*100).toFixed(2);
+        return `<b>${k.name}</b><br>开 ${d[0]}<br>收 ${d[1]}<br>低 ${d[2]}<br>高 ${d[3]}<br>涨跌 ${pct}%`;
+      }
+    },
     xAxis:{type:'category',data:dates,axisLine:{lineStyle:{color:'#1e2a42'}},axisLabel:{color:'#7c8db5',fontSize:10,interval: Math.floor(dates.length/6)}},
     yAxis:{scale:true,axisLine:{lineStyle:{color:'#1e2a42'}},axisLabel:{color:'#7c8db5',fontSize:10},splitLine:{lineStyle:{color:'#131a29'}}},
     dataZoom:[{type:'inside',xAxisIndex:0,start:30,end:100}],
-    series:[{type:'candlestick',data:ohlc,itemStyle:{color:'#ef4444',color0:'#22c55e',borderColor:'#ef4444',borderColor0:'#22c55e'}}]
+    series:[{
+      type:'candlestick',data:ohlc,
+      itemStyle:{color:'#ef4444',color0:'#22c55e',borderColor:'#ef4444',borderColor0:'#22c55e'},
+      markLine:{symbol:'none',animation:false,data:planLines}
+    }]
   });
 }
 
