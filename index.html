@@ -298,8 +298,20 @@ function renderWatchlist(){
     const s=watchScores[w.code];
     const score=s?s.score:'--';
     const grade=s?s.grade:'待分析';
-    const sigs=s?JSON.parse(s.signs||'[]'):[];
-    const topSigs=sigs.slice(0,3).map(x=>`<div style="font-size:11px;color:var(--sub);margin-top:2px">${x}</div>`).join('');
+    const sigs=s?JSON.parse(s.signals||'[]'):[];
+    const dims=s?JSON.parse(s.dims||'{}'):{};
+    const dimBars=Object.entries(dims).map(([name,d])=>{
+      const pct=Math.round(d.raw/d.max*100);
+      return `<div style="margin-top:6px">
+        <div style="display:flex;justify-content:space-between;font-size:11px">
+          <span style="color:var(--sub)">${name} <span style="opacity:.6">(权重${d.weight}%)</span></span>
+          <span style="color:${pct>=60?'var(--up)':pct>=30?'var(--gold)':'var(--down)'}">${d.raw}/${d.max}</span>
+        </div>
+        <div class="progress"><i style="width:${pct}%"></i></div>
+      </div>`;}).join('');
+    const dimReasons=Object.entries(dims).flatMap(([name,d])=>
+      d.reasons.map(r=>`<div style="font-size:11px;color:var(--sub);margin-top:2px">· <b>${name}</b>: ${r}</div>`)
+    ).join('');
     return `<div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center">
         <div>
@@ -315,7 +327,12 @@ function renderWatchlist(){
         </div>
       </div>
       ${s?`<div class="progress" style="margin-top:8px"><i style="width:${Math.min(s.score,100)}%"></i></div>`:''}
-      ${topSigs}
+      ${s&&s.summary?`<div style="font-size:11px;color:var(--gold);margin-top:8px;padding:8px;background:var(--card2);border-radius:8px">${s.summary}</div>`:''}
+      ${dimBars}
+      <details style="margin-top:8px">
+        <summary style="font-size:12px;color:var(--brand);cursor:pointer">查看评分依据明细</summary>
+        <div style="margin-top:6px">${dimReasons||'<span style="font-size:11px;color:var(--sub)">暂无明细</span>'}</div>
+      </details>
     </div>`;}).join('');
   return `
     <div class="card">

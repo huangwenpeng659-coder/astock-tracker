@@ -342,101 +342,117 @@ def analyze_stock(df):
     signals = []
     score = 50  # 基准分
 
-    # --- 1. 趋势 (权重30) ---
+    # 各维度明细: {名称: {weight, raw, points, reasons[]}}
+    dims = {}
+
+    # --- 1. 趋势 (权重30, 满分30) ---
     trend_score = 0
+    reasons = []
     if last['close'] > last['ma20']:
-        trend_score += 12; signals.append('✅ 股价站上MA20')
+        trend_score += 12; reasons.append('股价站上MA20(+12)')
     else:
-        signals.append('❌ 股价跌破MA20')
+        reasons.append('股价跌破MA20(0)')
     if last['ma5'] > last['ma10'] > last['ma20']:
-        trend_score += 10; signals.append('✅ 均线多头排列(MA5>MA10>MA20)')
+        trend_score += 10; reasons.append('均线多头排列(+10)')
     elif last['ma5'] < last['ma10'] < last['ma20']:
-        signals.append('⚠️ 均线空头排列')
+        reasons.append('均线空头排列(0)')
     if not pd.isna(last['ma60']):
         if last['close'] > last['ma60']:
-            trend_score += 8; signals.append('✅ 股价站上MA60(长期趋势向上)')
+            trend_score += 8; reasons.append('站上MA60长期向上(+8)')
         else:
-            signals.append('⚠️ 股价低于MA60')
+            reasons.append('低于MA60(0)')
+    dims['趋势'] = {'weight':30, 'raw':trend_score, 'max':30, 'reasons':reasons}
     score += trend_score * 0.3
+    signals.extend([('✅ ' if '+' in r else '⚠️ ') + r for r in reasons])
 
-    # --- 2. 动量/MACD (权重20) ---
+    # --- 2. 动量/MACD (权重20, 满分20) ---
     mom_score = 0
+    reasons = []
     if not pd.isna(last['macd_dif']):
         if last['macd_dif'] > last['macd_dea']:
-            mom_score += 10; signals.append('✅ MACD金叉/DIF在DEA上方')
+            mom_score += 10; reasons.append('MACD金叉，DIF在DEA上方(+10)')
         else:
-            signals.append('⚠️ MACD死叉/DIF在DEA下方')
+            reasons.append('MACD死叉，DIF在DEA下方(0)')
         if last['macd_hist'] > 0 and prev['macd_hist'] <= 0:
-            mom_score += 10; signals.append('🔥 MACD柱由负转正(金叉信号)')
+            mom_score += 10; reasons.append('MACD柱由负转正，金叉信号(+10)')
         elif last['macd_hist'] > prev['macd_hist']:
-            mom_score += 5
+            mom_score += 5; reasons.append('MACD柱放大(+5)')
+    dims['动量'] = {'weight':20, 'raw':mom_score, 'max':20, 'reasons':reasons}
     score += mom_score * 0.2
 
-    # --- 3. RSI (权重15) ---
+    # --- 3. RSI (权重15, 满分15) ---
+    rsi_score = 0
+    reasons = []
     if not pd.isna(last['rsi']):
         rsi = last['rsi']
         if rsi < 30:
-            score += 15; signals.append(f'🔥 RSI={rsi:.1f} 超卖(反弹机会)')
+            rsi_score += 15; reasons.append(f'RSI={rsi:.1f} 超卖区，反弹机会(+15)')
         elif rsi < 45:
-            score += 10; signals.append(f'✅ RSI={rsi:.1f} 偏低(低位区域)')
+            rsi_score += 10; reasons.append(f'RSI={rsi:.1f} 偏低，低位区域(+10)')
         elif rsi < 70:
-            score += 5; signals.append(f'⚖️ RSI={rsi:.1f} 中性')
+            rsi_score += 5; reasons.append(f'RSI={rsi:.1f} 中性(+5)')
         else:
-            signals.append(f'⚠️ RSI={rsi:.1f} 超买(回调风险)')
+            reasons.append(f'RSI={rsi:.1f} 超买区，回调风险(0)')
+    dims['RSI'] = {'weight':15, 'raw':rsi_score, 'max':15, 'reasons':reasons}
+    score += rsi_score * 0.15
 
-    # --- 4. 量能 (权重20) ---
+    # --- 4. 量能 (权重20, 满分20) ---
     vol_score = 0
+    reasons = []
     if not pd.isna(last['vol_ma5']) and not pd.isna(last['vol_ma20']):
         vol_ratio = last['vol_ma5'] / last['vol_ma20'] if last['vol_ma20'] > 0 else 1
         if 0.8 < vol_ratio < 1.5 and last['close'] > last['open']:
-            vol_score += 10; signals.append(f'✅ 温和放量上涨(量比{vol_ratio:.2f})')
+            vol_score += 10; reasons.append(f'量比{vol_ratio:.2f}，温和放量上涨(+10)')
         elif vol_ratio >= 1.5 and last['close'] > last['open']:
-            vol_score += 8; signals.append(f'🔥 明显放量上涨(量比{vol_ratio:.2f})')
+            vol_score += 8; reasons.append(f'量比{vol_ratio:.2f}，明显放量上涨(+8)')
         elif vol_ratio < 0.6:
-            signals.append(f'⚠️ 缩量(量比{vol_ratio:.2f})')
-            vol_score += 3
+            vol_score += 3; reasons.append(f'量比{vol_ratio:.2f}，缩量(只+3)')
         else:
-            vol_score += 5
-        # 量价背离检测
+            vol_score += 5; reasons.append(f'量比{vol_ratio:.2f}(+5)')
         recent5 = df.tail(5)
         price_up = recent5['close'].iloc[-1] > recent5['close'].iloc[0]
         vol_down = recent5['volume'].mean() < df['volume'].tail(20).mean()
         if price_up and vol_down:
-            signals.append('⚠️ 量价背离(涨但缩量)')
+            reasons.append('量价背离：上涨但缩量(-3)')
             vol_score -= 3
+    dims['量能'] = {'weight':20, 'raw':max(0,vol_score), 'max':20, 'reasons':reasons}
     score += vol_score * 0.2
 
-    # --- 5. 波动率/位置 (权重15) ---
-    vol_score2 = 0
+    # --- 5. 波动率/位置 (权重15, 满分15) ---
+    vol2_score = 0
+    reasons = []
     recent_vol = df['close'].tail(20).pct_change().std()
     if pd.notna(recent_vol):
         if recent_vol < 0.015:
-            vol_score2 += 8; signals.append('✅ 低波动(可能酝酿方向)')
+            vol2_score += 8; reasons.append('低波动，可能酝酿方向(+8)')
         elif recent_vol > 0.04:
-            signals.append(f'⚠️ 高波动(σ={recent_vol:.3f})')
+            reasons.append(f'高波动σ={recent_vol:.3f}(0)')
         else:
-            vol_score2 += 4
-    # 布林带位置
+            vol2_score += 4; reasons.append(f'波动适中(+4)')
     boll_width = (last['boll_upper'] - last['boll_lower']) / last['boll_mid'] if last['boll_mid'] > 0 else 0
     if boll_width < 0.1:
-        vol_score2 += 7; signals.append('🔥 布林带极度收口(即将变盘)')
+        vol2_score += 7; reasons.append('布林带极度收口，即将变盘(+7)')
     elif boll_width < 0.15:
-        vol_score2 += 4; signals.append('✅ 布林带收口')
+        vol2_score += 4; reasons.append('布林带收口(+4)')
     if last['close'] <= last['boll_lower']:
-        signals.append('🔥 触及布林带下轨(超卖)')
-        vol_score2 += 5
-    score += vol_score2 * 0.15
+        vol2_score += 5; reasons.append('触及布林下轨，超卖(+5)')
+    dims['波动'] = {'weight':15, 'raw':min(15,vol2_score), 'max':15, 'reasons':reasons}
+    score += vol2_score * 0.15
 
     score = max(0, min(100, round(score, 1)))
     grade = '强烈关注' if score >= 75 else '关注' if score >= 60 else '中性' if score >= 45 else '回避'
-    return {'score': score, 'grade': grade, 'signals': signals}, signals
+    summary = (f"基准分50 + 趋势{dims['趋势']['raw']}×30% + 动量{dims['动量']['raw']}×20% "
+               f"+ RSI{dims['RSI']['raw']}×15% + 量能{dims['量能']['raw']}×20% + 波动{dims['波动']['raw']}×15% = {score}")
+    return {'score': score, 'grade': grade, 'signals': signals, 'dims': dims, 'summary': summary}, signals
 
 def save_analysis(code, name, trade_date, result):
     try:
         supabase.table('stock_scores').upsert({
             'code': code, 'name': name, 'trade_date': trade_date,
             'score': result['score'], 'grade': result['grade'],
-            'signals': json.dumps(result['signals'], ensure_ascii=False)
+            'signals': json.dumps(result['signals'], ensure_ascii=False),
+            'dims': json.dumps(result['dims'], ensure_ascii=False),
+            'summary': result['summary']
         }, on_conflict='code,trade_date').execute()
     except Exception as e:
         print(f"保存分析失败 {code}: {e}")
