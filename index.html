@@ -99,9 +99,15 @@ const VIEWS = [
 ];
 
 async function loadCandidates(){
-  const today = new Date().toISOString().slice(0,10);
+  const {data:dateRows}=await sb.from('candidates')
+    .select('trade_date')
+    .order('trade_date',{ascending:false})
+    .limit(1);
+  if(!dateRows||!dateRows.length) return [];
+  const latest=dateRows[0].trade_date;
   const {data,error} = await sb.from('candidates')
     .select('*')
+    .eq('trade_date',latest)
     .order('score',{ascending:false})
     .limit(20);
   if(error){console.error('加载候选失败:',error);return [];}
