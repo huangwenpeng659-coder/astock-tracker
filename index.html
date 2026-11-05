@@ -87,6 +87,7 @@ let cur = 'radar';
 let klineChart = null;
 let candidates = [];
 let selectedStock = null;
+let dailySignals = {limitUp:[], steadyRise:[]};
 
 function fmt(v,d=2){return Number(v).toFixed(d)}
 
@@ -94,7 +95,7 @@ const VIEWS = [
   {id:'radar',name:'机会雷达',icon:'🎯'},
   {id:'watchlist',name:'自选股',icon:'⭐'},
   {id:'analysis',name:'个股分析',icon:'📈'},
-  {id:'review',name:'数据总览',icon:'📊'},
+  {id:'review',name:'策略复盘',icon:'📊'},
   {id:'settings',name:'选股设置',icon:'⚙️'},
 ];
 
@@ -114,6 +115,17 @@ async function loadCandidates(){
   return data||[];
 }
 
+async function loadSignals(){
+  try{
+    const {data:dateRows}=await sb.from('daily_signals').select('trade_date').order('trade_date',{ascending:false}).limit(1);
+    if(!dateRows||!dateRows.length) return;
+    const latest=dateRows[0].trade_date;
+    const {data}=await sb.from('daily_signals').select('*').eq('trade_date',latest);
+    dailySignals.limitUp=(data||[]).filter(d=>d.signal_type==='涨停');
+    dailySignals.steadyRise=(data||[]).filter(d=>d.signal_type==='放量上涨');
+  }catch(e){console.error('加载信号失败:',e);}
+}
+
 async function loadKline(code){
   const {data,error} = await sb.from('daily_kline')
     .select('*')
@@ -125,7 +137,29 @@ async function loadKline(code){
 }
 
 function renderRadar(){
-  if(!candidates.length) return `<div class="loading">暂无候选股票数据<br><span class="sub">等待交易日选股脚本运行后刷新</span></div>`;
+  // 涨停板区
+  let luHtml='';
+  if(dailySignals.limitUp.length){
+    const luItems=dailySignals.limitUp.map(s=>{
+      const d=s.details||{};
+      return `<div class="row"><div><div class="stock-name">${s.name||s.code}(${s.code})</div></div><div class="up" style="font-weight:600">${fmt(s.price)} +${fmt(d.pct||0)}%</div></div>`;
+    }).join('');
+    luHtml=`<div class="card" style="border-color:rgba(239,68,68,.4)">
+      <div class="card-title"><div class="t"><span class="dot" style="background:var(--up);box-shadow:0 0 8px var(--up)"></span>当日涨停板</div><span class="badge buy">${dailySignals.limitUp.length}只</span></div>${luItems}</div>`;
+  }
+  // 放量上涨区
+  let srHtml='';
+  if(dailySignals.steadyRise.length){
+    const srItems=dailySignals.steadyRise.map(s=>{
+      const d=s.details||{};
+      return `<div class="row"><div><div class="stock-name">${s.name||s.code}(${s.code})</div><div class="stock-code">三日连阳放量</div></div><div class="up" style="font-weight:600">3日 +${fmt(d.total_pct||0)}%</div></div>`;
+    }).join('');
+    srHtml=`<div class="card" style="border-color:rgba(59,130,246,.4)">
+      <div class="card-title"><div class="t"><span class="dot"></span>三日稳步放量上涨</div><span class="badge watch">${dailySignals.steadyRise.length}只</span></div>${srItems}</div>`;
+  }
+  // 候选列表
+  const noData=!candidates.length&&!dailySignals.limitUp.length&&!dailySignals.steadyRise.length;
+  if(noData) return `<div class="loading">暂无候选股票数据<br><span class="sub">等待交易日选股脚本运行后刷新</span></div>`;
   const items = candidates.map((c,i)=>{
     const pct = c.last_price && c.launch_point ? ((c.last_price-c.launch_point)/c.launch_point*100) : 0;
     return `
@@ -134,7 +168,7 @@ function renderRadar(){
         <div style="display:flex;align-items:center;gap:10px">
           <div class="rank ${i<3?'top':''}">${i+1}</div>
           <div>
-            <div class="stock-name">${c.code} <span class="badge buy">埋伏</span></div>
+            <div class="stock-name">${c.name||c.code}(${c.code}) <span class="badge buy">埋伏</span></div>
             <div class="stock-code">入场 ${fmt(c.launch_point)} · 止损 ${fmt(c.stop_loss)}</div>
           </div>
         </div>
@@ -151,7 +185,8 @@ function renderRadar(){
         <span>目标3 <b class="up">${fmt(c.target_3)}</b></span>
       </div>
     </div>`;}).join('');
-  return `<div class="card-title" style="padding:4px 4px 12px"><div class="t"><span class="dot"></span>机会雷达 · Top ${candidates.length}</div><span class="sub">启动形态确认</span></div>${items}
+  const candidateHtml=candidates.length?`<div class="card-title" style="padding:4px 4px 12px"><div class="t"><span class="dot"></span>启动形态候选 · Top ${candidates.length}</div><span class="sub">埋伏信号</span></div>${items}`:'';
+  return `${luHtml}${srHtml}${candidateHtml}
   <div class="notice">⚠️ 本工具仅供历史数据研究，不构成投资建议</div>`;
 }
 
@@ -161,7 +196,7 @@ function renderAnalysis(){
   return `
     <div class="card">
       <div class="card-title">
-        <div class="t"><span class="dot"></span>${c.code}</div>
+        <div class="t"><span class="dot"></span>${c.name||c.code}(${c.code})</div>
         <span class="badge buy">埋伏信号</span>
       </div>
       <div style="display:flex;justify-content:space-between;margin-bottom:10px">
@@ -234,34 +269,96 @@ async function initKline(){
   });
 }
 
+let trackingData = [];
+let trackingFilter = 'all';
+
+async function loadTracking(){
+  try{
+    const {data}=await sb.from('candidate_tracking').select('*').order('select_date',{ascending:false}).limit(200);
+    trackingData=data||[];
+  }catch(e){trackingData=[];}
+}
+
+function pctCell(val,label){
+  if(val==null) return `<div class="stat"><div class="v" style="color:var(--sub)">--</div><div class="l">${label}</div></div>`;
+  const c=val>=0?'var(--up)':'var(--down)';
+  return `<div class="stat"><div class="v" style="color:${c}">${val>=0?'+':''}${val.toFixed(2)}%</div><div class="l">${label}</div></div>`;
+}
+
 function renderReview(){
-  const total = candidates.length;
-  const avgScore = total ? (candidates.reduce((s,c)=>s+c.score,0)/total) : 0;
-  const high = candidates.filter(c=>c.score>=80).length;
+  const filtered=trackingFilter==='all'?trackingData:trackingData.filter(t=>t.status===trackingFilter);
+  const completed=trackingData.filter(t=>t.pct_5d!=null);
+  const c10=trackingData.filter(t=>t.pct_10d!=null);
+  const c20=trackingData.filter(t=>t.pct_20d!=null);
+  const win5=completed.length?completed.filter(t=>t.pct_5d>0).length:0;
+  const win10=c10.length?c10.filter(t=>t.pct_10d>0).length:0;
+  const win20=c20.length?c20.filter(t=>t.pct_20d>0).length:0;
+  const avg5=completed.length?(completed.reduce((s,t)=>s+t.pct_5d,0)/completed.length):0;
+  const avg10=c10.length?(c10.reduce((s,t)=>s+t.pct_10d,0)/c10.length):0;
+  const avg20=c20.length?(c20.reduce((s,t)=>s+t.pct_20d,0)/c20.length):0;
+  const maxG=trackingData.length?Math.max(...trackingData.map(t=>t.max_gain||0)):0;
+  const maxL=trackingData.length?Math.min(...trackingData.map(t=>t.max_loss||0)):0;
+
+  const filterBtns=['all','追踪中','已完成'].map(f=>
+    `<span class="tab ${trackingFilter===f?'active':''}" onclick="trackingFilter='${f}';render()" style="font-size:12px;padding:5px 12px">${f==='all'?'全部':f}</span>`
+  ).join('');
+
+  const statusTag=(t)=>{
+    if(t.hit_stop) return '<span class="badge risk">触及止损</span>';
+    if(t.hit_target>=3) return '<span class="badge buy">达目标3</span>';
+    if(t.hit_target>=2) return '<span class="badge buy">达目标2</span>';
+    if(t.hit_target>=1) return '<span class="badge watch">达目标1</span>';
+    if(t.status==='已完成') return '<span class="badge" style="background:var(--card2);color:var(--sub);border:1px solid var(--border)">已完成</span>';
+    return '<span class="badge watch">追踪中</span>';
+  };
+
+  const items=filtered.map(t=>{
+    const pct=t.pct_change||0;
+    const pc=pct>=0?'up':'down';
+    return `<div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div class="stock-name">${t.name||t.code} <span class="stock-code">${t.code}</span></div>
+          <div class="stock-code">入选 ${t.select_date} · 分数 ${t.select_score}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="${pc}" style="font-size:18px;font-weight:700">${pct>=0?'+':''}${pct.toFixed(2)}%</div>
+          ${statusTag(t)}
+        </div>
+      </div>
+      <div class="stat-grid" style="margin-top:10px">
+        ${pctCell(t.pct_5d,'5日')}
+        ${pctCell(t.pct_10d,'10日')}
+        ${pctCell(t.pct_20d,'20日')}
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:11px;color:var(--sub)">
+        <span>入选价 ${fmt(t.select_price)} → 当前 ${fmt(t.current_price)}</span>
+        <span>最大涨 <b class="up">${(t.max_gain||0).toFixed(1)}%</b> 最大跌 <b class="down">${(t.max_loss||0).toFixed(1)}%</b></span>
+      </div>
+    </div>`;}).join('');
+
   return `
     <div class="card">
-      <div class="card-title"><div class="t"><span class="dot"></span>选股数据总览</div><span class="sub">最新一期</span></div>
+      <div class="card-title"><div class="t"><span class="dot"></span>策略效果统计</div><span class="sub">共${trackingData.length}只</span></div>
       <div class="stat-grid">
-        <div class="stat"><div class="v">${total}</div><div class="l">候选股票数</div></div>
-        <div class="stat"><div class="v" style="color:var(--gold)">${fmt(avgScore,1)}</div><div class="l">平均质量分</div></div>
-        <div class="stat"><div class="v up">${high}</div><div class="l">高分(≥80)</div></div>
+        <div class="stat"><div class="v">${completed.length?Math.round(win5/completed.length*100):0}%</div><div class="l">5日胜率(${win5}/${completed.length})</div></div>
+        <div class="stat"><div class="v">${c10.length?Math.round(win10/c10.length*100):0}%</div><div class="l">10日胜率(${win10}/${c10.length})</div></div>
+        <div class="stat"><div class="v">${c20.length?Math.round(win20/c20.length*100):0}%</div><div class="l">20日胜率(${win20}/${c20.length})</div></div>
+      </div>
+      <div class="stat-grid" style="margin-top:8px">
+        <div class="stat"><div class="v ${avg5>=0?'up':'down'}">${avg5>=0?'+':''}${avg5.toFixed(2)}%</div><div class="l">平均5日</div></div>
+        <div class="stat"><div class="v ${avg10>=0?'up':'down'}">${avg10>=0?'+':''}${avg10.toFixed(2)}%</div><div class="l">平均10日</div></div>
+        <div class="stat"><div class="v ${avg20>=0?'up':'down'}">${avg20>=0?'+':''}${avg20.toFixed(2)}%</div><div class="l">平均20日</div></div>
+      </div>
+      <div class="stat-grid" style="margin-top:8px">
+        <div class="stat"><div class="v up">+${maxG.toFixed(1)}%</div><div class="l">最大盈利</div></div>
+        <div class="stat"><div class="v down">${maxL.toFixed(1)}%</div><div class="l">最大亏损</div></div>
+        <div class="stat"><div class="v">${trackingData.filter(t=>t.status==='追踪中').length}</div><div class="l">追踪中</div></div>
       </div>
     </div>
-    <div class="card">
-      <div class="card-title"><div class="t"><span class="dot"></span>候选列表</div></div>
-      ${candidates.map((c,i)=>`
-        <div class="row" onclick="selectStock('${c.code}');go('analysis')" style="cursor:pointer">
-          <div style="display:flex;align-items:center;gap:10px">
-            <div class="rank ${i<3?'top':''}">${i+1}</div>
-            <div><div class="stock-name">${c.code}</div><div class="stock-code">入场${fmt(c.launch_point)} 止损${fmt(c.stop_loss)}</div></div>
-          </div>
-          <div style="text-align:right">
-            <div style="font-weight:600">${fmt(c.last_price)}</div>
-            <div class="score" style="font-size:14px">${fmt(c.score,0)}分</div>
-          </div>
-        </div>`).join('')}
-    </div>
-    <div class="notice">⚠️ 数据来源于每日自动选股，仅供研究参考</div>`;
+    <div style="display:flex;gap:6px;margin-bottom:12px">${filterBtns}</div>
+    ${items.length?items:'<div class="loading">暂无追踪数据，选股后自动开始追踪</div>'}
+    <div class="notice">⚠️ 胜率基于历史数据，仅供策略优化参考</div>`;
 }
 
 // ============ 自选股 ============
@@ -462,6 +559,8 @@ async function init(){
   document.getElementById('view').innerHTML='<div class="loading">正在加载数据...</div>';
   currentConfig = await loadConfig();
   await loadWatchlist();
+  await loadTracking();
+  await loadSignals();
   candidates = await loadCandidates();
   if(candidates.length) selectedStock = candidates[0];
   render();

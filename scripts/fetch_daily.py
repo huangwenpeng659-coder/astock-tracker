@@ -461,7 +461,7 @@ def save_candidate(code, name, trade_date, score, last_price, launch_point, sign
     stop_loss = launch_point * 0.97
     try:
         supabase.table('candidates').upsert({
-            'code': code, 'trade_date': trade_date, 'score': round(score, 2),
+            'code': code, 'name': name, 'trade_date': trade_date, 'score': round(score, 2),
             'last_price': last_price, 'launch_point': launch_point,
             'stop_loss': round(stop_loss, 2),
             'target_1': round(last_price * 1.05, 2),
@@ -469,11 +469,148 @@ def save_candidate(code, name, trade_date, score, last_price, launch_point, sign
             'target_3': round(last_price * 1.15, 2),
             'signals': json.dumps(signals, ensure_ascii=False)
         }, on_conflict='code,trade_date').execute()
+        # 同时写入追踪表
+        supabase.table('candidate_tracking').upsert({
+            'code': code, 'select_date': trade_date, 'name': name,
+            'select_price': last_price, 'select_score': round(score, 2),
+            'current_price': last_price, 'days_since': 0,
+            'pct_change': 0, 'max_gain': 0, 'max_loss': 0,
+            'hit_target': 0, 'hit_stop': False, 'status': '追踪中'
+        }, on_conflict='code,select_date').execute()
     except Exception as e:
         print(f"保存候选失败 {code}: {e}")
 
 
 # ============ 主函数 ============
+
+# ============ 信号检测 ============
+
+def detect_limit_up(df):
+    if len(df) < 1:
+        return None
+    last = df.iloc[-1]
+    if last['change_pct'] >= 9.8:
+        return {'price': float(last['close']), 'pct': round(float(last['change_pct']), 2)}
+    return None
+
+def detect_steady_rise(df):
+    if len(df) < 4:
+        return None
+    recent = df.tail(3)
+    prev_vol = float(df.iloc[-4]['volume'])
+    prices = []
+    volumes = []
+    for _, row in recent.iterrows():
+        if row['close'] <= row['open']:
+            return None
+        if row['change_pct'] <= 0:
+            return None
+        if float(row['volume']) <= prev_vol:
+            return None
+        prev_vol = float(row['volume'])
+        prices.append(float(row['close']))
+        volumes.append(int(row['volume']))
+    total_pct = round((prices[-1] - float(df.iloc[-4]['close'])) / float(df.iloc[-4]['close']) * 100, 2)
+    return {'prices': prices, 'volumes': volumes, 'total_pct': total_pct}
+
+def save_signal(code, name, trade_date, signal_type, details):
+    try:
+        supabase.table('daily_signals').upsert({
+            'code': code, 'name': name, 'trade_date': trade_date,
+            'signal_type': signal_type,
+            'price': details.get('price', details.get('prices', [0])[-1]),
+            'details': details
+        }, on_conflict='code,trade_date,signal_type').execute()
+    except Exception as e:
+        print(f"保存信号失败 {code} {signal_type}: {e}")
+
+# ============ 追踪更新 ============
+
+def update_tracking():
+    """更新所有追踪中的候选股票的涨跌幅"""
+    try:
+        resp = supabase.table('candidate_tracking').select('*').eq('status', '追踪中').execute()
+        tracking = resp.data or []
+    except Exception as e:
+        print(f"读取追踪列表失败: {e}")
+        return
+
+    if not tracking:
+        print("无追踪中的候选")
+        return
+
+    print(f"\n===== 更新 {len(tracking)} 只追踪股票 =====")
+    for t in tracking:
+        code = t['code']
+        select_price = float(t['select_price'])
+        select_date = t['select_date']
+
+        try:
+            kl_resp = supabase.table('daily_kline').select('close,trade_date').eq('code', code).gte('trade_date', select_date).order('trade_date', desc=False).execute()
+            klines = kl_resp.data or []
+        except Exception as e:
+            print(f"  {code} 读取K线失败: {e}")
+            continue
+
+        if not klines:
+            continue
+
+        days_since = len(klines) - 1
+        current_price = float(klines[-1]['close'])
+        pct_change = round((current_price - select_price) / select_price * 100, 2)
+
+        prices = [float(k['close']) for k in klines]
+        max_price = max(prices)
+        min_price = min(prices)
+        max_gain = round((max_price - select_price) / select_price * 100, 2)
+        max_loss = round((min_price - select_price) / select_price * 100, 2)
+
+        update = {
+            'current_price': current_price,
+            'days_since': days_since,
+            'pct_change': pct_change,
+            'max_gain': max(max_gain, float(t.get('max_gain') or 0)),
+            'max_loss': min(max_loss, float(t.get('max_loss') or 0)),
+        }
+
+        # 固化 5/10/20 日涨跌幅
+        if days_since >= 5 and t.get('pct_5d') is None:
+            p5 = float(klines[5]['close']) if len(klines) > 5 else current_price
+            update['pct_5d'] = round((p5 - select_price) / select_price * 100, 2)
+        if days_since >= 10 and t.get('pct_10d') is None:
+            p10 = float(klines[10]['close']) if len(klines) > 10 else current_price
+            update['pct_10d'] = round((p10 - select_price) / select_price * 100, 2)
+        if days_since >= 20 and t.get('pct_20d') is None:
+            p20 = float(klines[20]['close']) if len(klines) > 20 else current_price
+            update['pct_20d'] = round((p20 - select_price) / select_price * 100, 2)
+
+        # 检查是否触及止损/目标
+        try:
+            cand_resp = supabase.table('candidates').select('stop_loss,target_1,target_2,target_3').eq('code', code).eq('trade_date', select_date).execute()
+            if cand_resp.data:
+                cand = cand_resp.data[0]
+                stop = float(cand.get('stop_loss') or 0)
+                targets = [float(cand.get(f'target_{i}') or 0) for i in [1, 2, 3]]
+                if stop > 0 and min_price <= stop:
+                    update['hit_stop'] = True
+                hit = 0
+                for i, tgt in enumerate(targets, 1):
+                    if tgt > 0 and max_price >= tgt:
+                        hit = i
+                update['hit_target'] = hit
+        except:
+            pass
+
+        if days_since >= 20:
+            update['status'] = '已完成'
+
+        try:
+            supabase.table('candidate_tracking').update(update).eq('code', code).eq('select_date', select_date).execute()
+            status_tag = update.get('status', '追踪中')
+            print(f"  {t.get('name', code)}({code}): {days_since}天 {pct_change:+.2f}% [{status_tag}]")
+        except Exception as e:
+            print(f"  {code} 更新追踪失败: {e}")
+
 
 def main():
     params = load_config()
@@ -523,6 +660,16 @@ def main():
                 save_candidate(code, name, today, score, pattern['last_price'], pattern['launch_point'], details)
                 print(f"发现候选: {name}({code}) 分数:{score:.1f}")
 
+        lu = detect_limit_up(df)
+        if lu:
+            save_signal(code, name, today, '涨停', lu)
+            print(f"  涨停: {name}({code}) {lu['pct']:.1f}%")
+
+        sr = detect_steady_rise(df)
+        if sr:
+            save_signal(code, name, today, '放量上涨', sr)
+            print(f"  放量上涨: {name}({code}) 3日{sr['total_pct']:.1f}%")
+
         if idx % 20 == 0:
             print(f"进度: {idx}/{len(stock_pool)}，成功抓取 {success_count} 只")
 
@@ -534,6 +681,9 @@ def main():
     print(f"选股完成，共发现 {len(candidates)} 只候选股票")
     for c in candidates[:5]:
         print(f"  {c['name']}({c['code']}): {c['score']:.1f}分")
+
+    # 更新历史追踪
+    update_tracking()
 
 if __name__ == "__main__":
     main()
