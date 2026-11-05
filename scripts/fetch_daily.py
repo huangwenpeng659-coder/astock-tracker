@@ -483,6 +483,183 @@ def save_candidate(code, name, trade_date, score, last_price, launch_point, sign
 
 # ============ 主函数 ============
 
+# ============ 日内做T分析 ============
+
+def get_stock_industry(code):
+    try:
+        df = ak.stock_individual_info_em(symbol=code)
+        row = df.loc[df['item'] == '行业', 'value']
+        return row.values[0] if len(row) else None
+    except:
+        return None
+
+def get_industry_leaders(industry_name):
+    try:
+        df = ak.stock_board_industry_cons_em(symbol=industry_name)
+        df = df.sort_values('涨跌幅', ascending=False).head(3)
+        return [{'code': str(r['代码']).zfill(6), 'name': r['名称'], 'pct': round(float(r['涨跌幅']), 2)} for _, r in df.iterrows()]
+    except:
+        return []
+
+def fetch_min_kline(code, period='5'):
+    try:
+        df = ak.stock_zh_a_hist_min_em(symbol=code, period=period, adjust='')
+        if df is None or df.empty:
+            return None
+        df = df.rename(columns={'时间': 'time', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low', '成交量': 'volume', '成交额': 'amount'})
+        for c in ['open', 'close', 'high', 'low', 'volume', 'amount']:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        df = df[df['time'].str.startswith(today_str)]
+        if df.empty:
+            df_all = ak.stock_zh_a_hist_min_em(symbol=code, period=period, adjust='')
+            df_all = df_all.rename(columns={'时间': 'time', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low', '成交量': 'volume', '成交额': 'amount'})
+            for c in ['open', 'close', 'high', 'low', 'volume', 'amount']:
+                if c in df_all.columns:
+                    df_all[c] = pd.to_numeric(df_all[c], errors='coerce')
+            last_date = df_all['time'].iloc[-1][:10]
+            df = df_all[df_all['time'].str.startswith(last_date)]
+        return df.reset_index(drop=True) if not df.empty else None
+    except Exception as e:
+        print(f"  获取分钟K线失败 {code}: {e}")
+        return None
+
+def calc_kdj(high, low, close, n=9, m1=3, m2=3):
+    lowest = low.rolling(n).min()
+    highest = high.rolling(n).max()
+    rsv = (close - lowest) / (highest - lowest) * 100
+    rsv = rsv.fillna(50)
+    k = rsv.ewm(com=m1-1, adjust=False).mean()
+    d = k.ewm(com=m2-1, adjust=False).mean()
+    j = 3 * k - 2 * d
+    return k, d, j
+
+def calc_t_signals(df_min, leaders=None):
+    if df_min is None or len(df_min) < 10:
+        return None
+    df = df_min.copy()
+    signals = []
+
+    df['cum_amount'] = df['amount'].cumsum()
+    df['cum_volume'] = df['volume'].cumsum()
+    df['vwap'] = df['cum_amount'] / df['cum_volume']
+    vwap_last = float(df['vwap'].iloc[-1])
+
+    # VWAP信号
+    for i in range(max(1, len(df)-6), len(df)):
+        row = df.iloc[i]
+        dev = (row['close'] - row['vwap']) / row['vwap'] * 100 if row['vwap'] > 0 else 0
+        if dev < -0.5:
+            signals.append({'time': row['time'][-8:], 'type': '买入', 'reason': f'价格低于VWAP {abs(dev):.1f}%', 'indicator': 'VWAP'})
+        elif dev > 0.5:
+            signals.append({'time': row['time'][-8:], 'type': '卖出', 'reason': f'价格高于VWAP {dev:.1f}%', 'indicator': 'VWAP'})
+
+    # 量能突变
+    df['vol_ma20'] = df['volume'].rolling(20).mean()
+    for i in range(max(20, len(df)-6), len(df)):
+        row = df.iloc[i]
+        if pd.notna(row['vol_ma20']) and row['vol_ma20'] > 0:
+            ratio = row['volume'] / row['vol_ma20']
+            if ratio >= 2:
+                if row['close'] > row['open']:
+                    signals.append({'time': row['time'][-8:], 'type': '买入', 'reason': f'放量上涨(量比{ratio:.1f}倍)', 'indicator': '量能'})
+                else:
+                    signals.append({'time': row['time'][-8:], 'type': '卖出', 'reason': f'放量下跌(量比{ratio:.1f}倍)', 'indicator': '量能'})
+
+    # 分钟MACD
+    dif, dea, hist = calc_macd(df['close'], 12, 26, 9)
+    for i in range(max(1, len(df)-6), len(df)):
+        if i < 1:
+            continue
+        if pd.notna(hist.iloc[i]) and pd.notna(hist.iloc[i-1]):
+            if hist.iloc[i] > 0 and hist.iloc[i-1] <= 0:
+                signals.append({'time': df.iloc[i]['time'][-8:], 'type': '买入', 'reason': 'MACD金叉', 'indicator': 'MACD'})
+            elif hist.iloc[i] < 0 and hist.iloc[i-1] >= 0:
+                signals.append({'time': df.iloc[i]['time'][-8:], 'type': '卖出', 'reason': 'MACD死叉', 'indicator': 'MACD'})
+
+    # KDJ
+    k, d, j = calc_kdj(df['high'], df['low'], df['close'])
+    last_j = float(j.iloc[-1]) if pd.notna(j.iloc[-1]) else 50
+    if last_j < 20:
+        signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '买入', 'reason': f'KDJ超卖(J={last_j:.0f})', 'indicator': 'KDJ'})
+    elif last_j > 80:
+        signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '卖出', 'reason': f'KDJ超买(J={last_j:.0f})', 'indicator': 'KDJ'})
+
+    # 布林带
+    boll_mid = df['close'].rolling(20).mean()
+    boll_std = df['close'].rolling(20).std()
+    boll_upper = boll_mid + 2 * boll_std
+    boll_lower = boll_mid - 2 * boll_std
+    if len(df) >= 20:
+        last_close = df.iloc[-1]['close']
+        if pd.notna(boll_lower.iloc[-1]) and last_close <= boll_lower.iloc[-1]:
+            signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '买入', 'reason': '触及布林下轨', 'indicator': '布林带'})
+        if pd.notna(boll_upper.iloc[-1]) and last_close >= boll_upper.iloc[-1]:
+            signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '卖出', 'reason': '触及布林上轨', 'indicator': '布林带'})
+
+    # 板块联动
+    leader_corr = ''
+    if leaders:
+        target_pct = (df.iloc[-1]['close'] - df.iloc[0]['open']) / df.iloc[0]['open'] * 100 if df.iloc[0]['open'] > 0 else 0
+        leader_avg = sum(l['pct'] for l in leaders) / len(leaders)
+        if leader_avg > 1 and target_pct < leader_avg * 0.5:
+            leader_corr = f'板块龙头平均涨{leader_avg:.1f}%，目标股仅涨{target_pct:.1f}%，存在补涨机会'
+            signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '买入', 'reason': f'板块联动补涨(龙头+{leader_avg:.1f}%)', 'indicator': '板块'})
+        elif leader_avg < -1 and target_pct > leader_avg * 0.5:
+            leader_corr = f'板块龙头平均跌{leader_avg:.1f}%，目标股仅跌{target_pct:.1f}%，注意补跌风险'
+            signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '卖出', 'reason': f'板块联动补跌风险(龙头{leader_avg:.1f}%)', 'indicator': '板块'})
+        else:
+            leader_corr = f'板块龙头平均{leader_avg:+.1f}%，目标股{target_pct:+.1f}%，走势基本同步'
+
+    # 综合建议
+    buy_count = len([s for s in signals if s['type'] == '买入'])
+    sell_count = len([s for s in signals if s['type'] == '卖出'])
+    if buy_count >= 3:
+        advice, confidence = '建议做T买入', '高'
+    elif buy_count >= 2:
+        advice, confidence = '可考虑做T买入', '中'
+    elif sell_count >= 3:
+        advice, confidence = '建议做T卖出', '高'
+    elif sell_count >= 2:
+        advice, confidence = '可考虑做T卖出', '中'
+    elif buy_count > 0 and sell_count > 0:
+        advice, confidence = '信号矛盾，建议观望', '低'
+    else:
+        advice, confidence = '信号不足，继续观察', '低'
+
+    min_data = [{'t': r['time'][-8:], 'o': round(r['open'], 2), 'c': round(r['close'], 2),
+                 'h': round(r['high'], 2), 'l': round(r['low'], 2), 'v': int(r['volume']),
+                 'vwap': round(r['vwap'], 2) if pd.notna(r['vwap']) else None}
+                for _, r in df.iterrows()]
+
+    return {
+        'vwap': round(vwap_last, 2),
+        'signals': signals,
+        'leaders': leaders or [],
+        'leader_correlation': leader_corr,
+        'advice': advice,
+        'confidence': confidence,
+        'min_kline': min_data
+    }
+
+def save_t_strategy(code, name, trade_date, industry, result):
+    try:
+        supabase.table('t_strategy').upsert({
+            'code': code, 'name': name, 'trade_date': trade_date,
+            'vwap': result['vwap'],
+            'signals': json.dumps(result['signals'], ensure_ascii=False),
+            'industry': industry or '',
+            'leaders': json.dumps(result['leaders'], ensure_ascii=False),
+            'leader_correlation': result['leader_correlation'],
+            'advice': result['advice'],
+            'confidence': result['confidence'],
+            'min_kline': json.dumps(result['min_kline'], ensure_ascii=False)
+        }, on_conflict='code,trade_date').execute()
+        print(f"  做T分析: {name}({code}) → {result['advice']}[{result['confidence']}]")
+    except Exception as e:
+        print(f"  保存做T分析失败 {code}: {e}")
+
 # ============ 信号检测 ============
 
 def detect_limit_up(df):
@@ -637,6 +814,19 @@ def main():
             if result:
                 save_analysis(code, name, today, result)
                 print(f"  {name}({code}): {result['score']}分 [{result['grade']}]")
+            # 做T分析
+            try:
+                min_df = fetch_min_kline(code)
+                if min_df is not None and len(min_df) >= 10:
+                    industry = get_stock_industry(code)
+                    leaders = get_industry_leaders(industry) if industry else []
+                    t_result = calc_t_signals(min_df, leaders)
+                    if t_result:
+                        save_t_strategy(code, name, today, industry, t_result)
+                else:
+                    print(f"  {name}({code}) 分钟K线不足，跳过做T分析")
+            except Exception as e:
+                print(f"  {name}({code}) 做T分析异常: {e}")
 
     # --- 全池选股 ---
     stock_pool = get_dynamic_stock_pool()

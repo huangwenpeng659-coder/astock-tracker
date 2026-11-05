@@ -212,7 +212,8 @@ function renderAnalysis(){
       <div class="row"><span class="sub">目标位1 (+5%)</span><b class="up">${fmt(c.target_1)}</b></div>
       <div class="row"><span class="sub">目标位2 (+10%)</span><b class="up">${fmt(c.target_2)}</b></div>
       <div class="row"><span class="sub">目标位3 (+15%)</span><b class="up">${fmt(c.target_3)}</b></div>
-    </div>`;
+    </div>
+    <div id="t-strategy-area"><div class="loading">加载做T分析...</div></div>`;
 }
 
 async function initKline(){
@@ -267,6 +268,94 @@ async function initKline(){
       markLine:{symbol:'none',animation:false,data:planLines}
     }]
   });
+}
+
+// ============ 做T分析 ============
+
+let tMinChart = null;
+
+async function loadTStrategy(code){
+  try{
+    const {data}=await sb.from('t_strategy').select('*').eq('code',code).order('trade_date',{ascending:false}).limit(1);
+    return (data&&data[0])||null;
+  }catch(e){return null;}
+}
+
+async function renderTStrategy(){
+  const c = selectedStock || candidates[0];
+  if(!c) return;
+  const area = document.getElementById('t-strategy-area');
+  if(!area) return;
+  const ts = await loadTStrategy(c.code);
+  if(!ts){area.innerHTML='<div class="card"><div class="card-title"><div class="t"><span class="dot" style="background:var(--purple);box-shadow:0 0 8px var(--purple)"></span>做T分析</div></div><div class="sub" style="text-align:center;padding:20px">暂无做T数据，将在下次脚本运行后生成<br>请确保该股票已加入自选股</div></div>';return;}
+
+  const signals=JSON.parse(ts.signals||'[]');
+  const leaders=JSON.parse(ts.leaders||'[]');
+  const minKline=JSON.parse(ts.min_kline||'[]');
+
+  const confColor=ts.confidence==='高'?'var(--up)':ts.confidence==='中'?'var(--gold)':'var(--sub)';
+  const advColor=ts.advice.includes('买入')?'var(--up)':ts.advice.includes('卖出')?'var(--down)':'var(--sub)';
+
+  const sigList=signals.slice(-10).map(s=>{
+    const tc=s.type==='买入'?'up':'down';
+    return `<div class="row" style="padding:6px 0"><div><span class="${tc}" style="font-weight:600">${s.type}</span> <span class="sub">${s.time}</span></div><div class="sub">${s.reason} <span class="badge ${s.type==='买入'?'buy':'risk'}" style="font-size:10px">${s.indicator}</span></div></div>`;
+  }).join('');
+
+  const leaderList=leaders.map(l=>`<div class="row" style="padding:6px 0"><div class="stock-name">${l.name}(${l.code})</div><div class="${l.pct>=0?'up':'down'}" style="font-weight:600">${l.pct>=0?'+':''}${l.pct}%</div></div>`).join('');
+
+  area.innerHTML=`
+    <div class="card" style="border-color:rgba(139,92,246,.4)">
+      <div class="card-title"><div class="t"><span class="dot" style="background:var(--purple);box-shadow:0 0 8px var(--purple)"></span>做T综合建议</div><span class="badge" style="background:rgba(139,92,246,.15);color:var(--purple);border:1px solid rgba(139,92,246,.3)">置信度: ${ts.confidence}</span></div>
+      <div style="text-align:center;padding:12px 0">
+        <div style="font-size:24px;font-weight:700;color:${advColor}">${ts.advice}</div>
+        <div class="sub" style="margin-top:4px">VWAP均价 ${ts.vwap}</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title"><div class="t"><span class="dot" style="background:var(--purple);box-shadow:0 0 8px var(--purple)"></span>5分钟分时图</div></div>
+      <div id="min-kline" style="width:100%;height:220px"></div>
+    </div>
+    ${leaders.length?`<div class="card">
+      <div class="card-title"><div class="t"><span class="dot"></span>板块联动 · ${ts.industry||''}</div></div>
+      ${leaderList}
+      ${ts.leader_correlation?`<div class="sub" style="margin-top:8px;padding:8px;background:var(--card2);border-radius:8px;font-size:12px">${ts.leader_correlation}</div>`:''}
+    </div>`:''}
+    <div class="card">
+      <div class="card-title"><div class="t"><span class="dot"></span>做T信号明细</div><span class="sub">买${signals.filter(s=>s.type==='买入').length} 卖${signals.filter(s=>s.type==='卖出').length}</span></div>
+      ${sigList||'<div class="sub" style="text-align:center;padding:12px">暂无信号</div>'}
+    </div>
+    <div class="notice">⚠️ 日内做T仅供参考，注意仓位管理和交易成本</div>`;
+
+  // 画分时图
+  if(minKline.length&&window.echarts){
+    setTimeout(()=>{
+      const el=document.getElementById('min-kline');
+      if(!el)return;
+      if(tMinChart)tMinChart.dispose();
+      tMinChart=echarts.init(el);
+      const times=minKline.map(k=>k.t);
+      const closes=minKline.map(k=>k.c);
+      const vwaps=minKline.map(k=>k.vwap);
+      const vols=minKline.map(k=>k.v);
+      // 信号标注
+      const buyPts=signals.filter(s=>s.type==='买入').map(s=>{const idx=times.indexOf(s.time);return idx>=0?{coord:[idx,closes[idx]],symbol:'triangle',symbolSize:10,itemStyle:{color:'#22c55e'},label:{show:false}}:null;}).filter(Boolean);
+      const sellPts=signals.filter(s=>s.type==='卖出').map(s=>{const idx=times.indexOf(s.time);return idx>=0?{coord:[idx,closes[idx]],symbol:'pin',symbolSize:10,symbolRotate:180,itemStyle:{color:'#ef4444'},label:{show:false}}:null;}).filter(Boolean);
+      tMinChart.setOption({
+        backgroundColor:'transparent',
+        grid:[{left:45,right:10,top:10,bottom:'35%'},{left:45,right:10,top:'70%',bottom:30}],
+        axisPointer:{link:[{xAxisIndex:'all'}],label:{backgroundColor:'#1e3a8a',color:'#e5edff',fontSize:10}},
+        tooltip:{trigger:'axis',axisPointer:{type:'cross',crossStyle:{color:'#7c8db5'}},backgroundColor:'#131a29',borderColor:'#1e2a42',textStyle:{color:'#e5edff',fontSize:11}},
+        xAxis:[{type:'category',data:times,gridIndex:0,axisLabel:{show:false},axisLine:{lineStyle:{color:'#1e2a42'}}},{type:'category',data:times,gridIndex:1,axisLabel:{color:'#7c8db5',fontSize:9,interval:Math.floor(times.length/5)},axisLine:{lineStyle:{color:'#1e2a42'}}}],
+        yAxis:[{scale:true,gridIndex:0,axisLabel:{color:'#7c8db5',fontSize:10},splitLine:{lineStyle:{color:'#131a29'}},axisLine:{lineStyle:{color:'#1e2a42'}}},{gridIndex:1,axisLabel:{show:false},splitLine:{show:false},axisLine:{lineStyle:{color:'#1e2a42'}}}],
+        series:[
+          {name:'价格',type:'line',data:closes,xAxisIndex:0,yAxisIndex:0,lineStyle:{color:'#3b82f6',width:1.5},symbol:'none',areaStyle:{color:{type:'linear',x:0,y:0,x2:0,y2:1,colorStops:[{offset:0,color:'rgba(59,130,246,.15)'},{offset:1,color:'rgba(59,130,246,0)'}]}},
+           markPoint:{data:[...buyPts,...sellPts]}},
+          {name:'VWAP',type:'line',data:vwaps,xAxisIndex:0,yAxisIndex:0,lineStyle:{color:'#f5b942',type:'dashed',width:1},symbol:'none'},
+          {name:'成交量',type:'bar',data:vols,xAxisIndex:1,yAxisIndex:1,itemStyle:{color:function(p){return closes[p.dataIndex]>=(closes[p.dataIndex-1]||closes[p.dataIndex])?'rgba(239,68,68,.5)':'rgba(34,197,94,.5)'}}}
+        ]
+      });
+    },100);
+  }
 }
 
 let trackingData = [];
@@ -544,7 +633,7 @@ async function render(){
   const v = document.getElementById('view');
   if(cur==='radar') v.innerHTML = renderRadar();
   else if(cur==='watchlist') v.innerHTML = renderWatchlist();
-  else if(cur==='analysis'){ v.innerHTML = renderAnalysis(); setTimeout(initKline,50); }
+  else if(cur==='analysis'){ v.innerHTML = renderAnalysis(); setTimeout(initKline,50); setTimeout(renderTStrategy,200); }
   else if(cur==='review') v.innerHTML = renderReview();
   else if(cur==='settings') v.innerHTML = renderSettings();
   window.scrollTo(0,0);
