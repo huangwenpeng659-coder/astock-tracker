@@ -7,10 +7,22 @@ A股每日数据抓取 + 启动形态选股脚本
 import os
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import akshare as ak
+import requests
 from supabase import create_client
+
+# 统一使用北京时间：CI runner 默认 UTC，直接用 datetime.now() 会导致交易日错位
+try:
+    from zoneinfo import ZoneInfo
+    CN_TZ = ZoneInfo("Asia/Shanghai")
+except Exception:
+    CN_TZ = timezone(timedelta(hours=8))
+
+def now_cn():
+    return datetime.now(CN_TZ)
 
 supabase = create_client(
     os.environ["SUPABASE_URL"],
@@ -157,8 +169,8 @@ def save_stock_basic(code, name):
 
 def _fetch_kline_sina(code):
     sina_symbol = get_sina_symbol(code)
-    start = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d")
-    end = datetime.now().strftime("%Y%m%d")
+    start = (now_cn() - timedelta(days=180)).strftime("%Y%m%d")
+    end = now_cn().strftime("%Y%m%d")
     return ak.stock_zh_a_daily(symbol=sina_symbol, start_date=start, end_date=end, adjust="qfq")
 
 def fetch_and_save_kline(code):
@@ -485,21 +497,41 @@ def save_candidate(code, name, trade_date, score, last_price, launch_point, sign
 
 # ============ 日内做T分析 ============
 
+# 行业龙头按行业名缓存：多个候选股常属同一行业，避免重复请求
+_leaders_cache = {}
+
 def get_stock_industry(code):
+    """获取行业。akshare 封装随版本变动易失效，失败时直接回退东财接口"""
     try:
         df = ak.stock_individual_info_em(symbol=code)
         row = df.loc[df['item'] == '行业', 'value']
-        return row.values[0] if len(row) else None
-    except:
+        if len(row):
+            return row.values[0]
+    except Exception:
+        pass
+    try:
+        market = 1 if code.startswith('6') else 0
+        r = requests.get(
+            'https://push2.eastmoney.com/api/qt/stock/get',
+            params={'fltt': '2', 'invt': '2', 'fields': 'f127', 'secid': f'{market}.{code}'},
+            timeout=15)
+        return ((r.json() or {}).get('data') or {}).get('f127')
+    except Exception:
         return None
 
 def get_industry_leaders(industry_name):
+    if not industry_name:
+        return []
+    if industry_name in _leaders_cache:
+        return _leaders_cache[industry_name]
     try:
         df = ak.stock_board_industry_cons_em(symbol=industry_name)
         df = df.sort_values('涨跌幅', ascending=False).head(3)
-        return [{'code': str(r['代码']).zfill(6), 'name': r['名称'], 'pct': round(float(r['涨跌幅']), 2)} for _, r in df.iterrows()]
+        leaders = [{'code': str(r['代码']).zfill(6), 'name': r['名称'], 'pct': round(float(r['涨跌幅']), 2)} for _, r in df.iterrows()]
     except:
-        return []
+        leaders = []
+    _leaders_cache[industry_name] = leaders
+    return leaders
 
 def fetch_min_kline(code, period='5'):
     try:
@@ -510,16 +542,9 @@ def fetch_min_kline(code, period='5'):
         for c in ['open', 'close', 'high', 'low', 'volume', 'amount']:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
-        today_str = datetime.now().strftime('%Y-%m-%d')
-        df = df[df['time'].str.startswith(today_str)]
-        if df.empty:
-            df_all = ak.stock_zh_a_hist_min_em(symbol=code, period=period, adjust='')
-            df_all = df_all.rename(columns={'时间': 'time', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low', '成交量': 'volume', '成交额': 'amount'})
-            for c in ['open', 'close', 'high', 'low', 'volume', 'amount']:
-                if c in df_all.columns:
-                    df_all[c] = pd.to_numeric(df_all[c], errors='coerce')
-            last_date = df_all['time'].iloc[-1][:10]
-            df = df_all[df_all['time'].str.startswith(last_date)]
+        # 接口一次返回近一个月数据，直接取最新交易日，避免重复请求
+        last_date = df['time'].iloc[-1][:10]
+        df = df[df['time'].str.startswith(last_date)]
         return df.reset_index(drop=True) if not df.empty else None
     except Exception as e:
         print(f"  获取分钟K线失败 {code}: {e}")
@@ -543,7 +568,8 @@ def calc_t_signals(df_min, leaders=None):
 
     df['cum_amount'] = df['amount'].cumsum()
     df['cum_volume'] = df['volume'].cumsum()
-    df['vwap'] = df['cum_amount'] / df['cum_volume']
+    # akshare 分钟K：成交额单位为元，成交量单位为手（1手=100股）
+    df['vwap'] = df['cum_amount'] / (df['cum_volume'] * 100)
     vwap_last = float(df['vwap'].iloc[-1])
 
     # VWAP信号
@@ -612,9 +638,9 @@ def calc_t_signals(df_min, leaders=None):
         else:
             leader_corr = f'板块龙头平均{leader_avg:+.1f}%，目标股{target_pct:+.1f}%，走势基本同步'
 
-    # 综合建议
-    buy_count = len([s for s in signals if s['type'] == '买入'])
-    sell_count = len([s for s in signals if s['type'] == '卖出'])
+    # 综合建议：按共振指标数计，避免同一指标多根K线重复计数抬高置信度
+    buy_count = len({s['indicator'] for s in signals if s['type'] == '买入'})
+    sell_count = len({s['indicator'] for s in signals if s['type'] == '卖出'})
     if buy_count >= 3:
         advice, confidence = '建议做T买入', '高'
     elif buy_count >= 2:
@@ -789,9 +815,33 @@ def update_tracking():
             print(f"  {code} 更新追踪失败: {e}")
 
 
+def run_t_analysis(code, name, trade_date):
+    try:
+        min_df = fetch_min_kline(code)
+        if min_df is None or len(min_df) < 10:
+            print(f"  {name}({code}) 分钟K线不足，跳过做T分析")
+            return
+        industry = get_stock_industry(code)
+        leaders = get_industry_leaders(industry) if industry else []
+        t_result = calc_t_signals(min_df, leaders)
+        if t_result:
+            save_t_strategy(code, name, trade_date, industry, t_result)
+    except Exception as e:
+        print(f"  {name}({code}) 做T分析异常: {e}")
+
+
+def run_t_analysis_batch(stocks, trade_date, max_workers=6, label="股票"):
+    """并发做T分析：每只股票需3次网络请求（分钟K/行业/龙头），串行会很慢"""
+    if not stocks:
+        return
+    print(f"\n===== 做T分析 {len(stocks)} 只{label} =====")
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        list(ex.map(lambda s: run_t_analysis(s['code'], s['name'], trade_date), stocks))
+
+
 def main():
     params = load_config()
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = now_cn().strftime("%Y-%m-%d")
 
     # --- 自选股分析 ---
     try:
@@ -803,6 +853,7 @@ def main():
 
     if watchlist:
         print(f"\n===== 分析 {len(watchlist)} 只自选股 =====")
+        t_targets = []
         for item in watchlist:
             code = item['code']
             name = item.get('name', code)
@@ -814,19 +865,8 @@ def main():
             if result:
                 save_analysis(code, name, today, result)
                 print(f"  {name}({code}): {result['score']}分 [{result['grade']}]")
-            # 做T分析
-            try:
-                min_df = fetch_min_kline(code)
-                if min_df is not None and len(min_df) >= 10:
-                    industry = get_stock_industry(code)
-                    leaders = get_industry_leaders(industry) if industry else []
-                    t_result = calc_t_signals(min_df, leaders)
-                    if t_result:
-                        save_t_strategy(code, name, today, industry, t_result)
-                else:
-                    print(f"  {name}({code}) 分钟K线不足，跳过做T分析")
-            except Exception as e:
-                print(f"  {name}({code}) 做T分析异常: {e}")
+            t_targets.append({'code': code, 'name': name})
+        run_t_analysis_batch(t_targets, today, label="自选股")
 
     # --- 全池选股 ---
     stock_pool = get_dynamic_stock_pool()
@@ -866,6 +906,9 @@ def main():
     candidates.sort(key=lambda x: x['score'], reverse=True)
     for rank, c in enumerate(candidates[:20], 1):
         supabase.table('candidates').update({'rank': rank}).eq('code', c['code']).eq('trade_date', today).execute()
+
+    # --- 候选股做T分析 ---
+    run_t_analysis_batch(candidates[:20], today, label="候选股")
 
     print(f"\n抓取完成，成功 {success_count}/{len(stock_pool)} 只")
     print(f"选股完成，共发现 {len(candidates)} 只候选股票")

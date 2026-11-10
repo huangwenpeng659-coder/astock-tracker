@@ -94,6 +94,7 @@ function fmt(v,d=2){return Number(v).toFixed(d)}
 const VIEWS = [
   {id:'radar',name:'机会雷达',icon:'🎯'},
   {id:'watchlist',name:'自选股',icon:'⭐'},
+  {id:'tsignals',name:'做T信号',icon:'🔄'},
   {id:'analysis',name:'个股分析',icon:'📈'},
   {id:'review',name:'策略复盘',icon:'📊'},
   {id:'settings',name:'选股设置',icon:'⚙️'},
@@ -162,13 +163,15 @@ function renderRadar(){
   if(noData) return `<div class="loading">暂无候选股票数据<br><span class="sub">等待交易日选股脚本运行后刷新</span></div>`;
   const items = candidates.map((c,i)=>{
     const pct = c.last_price && c.launch_point ? ((c.last_price-c.launch_point)/c.launch_point*100) : 0;
+    const t = tSignals[c.code] ? normalizeTData(tSignals[c.code]) : null;
+    const tBadge = t ? `<span class="badge" style="background:rgba(139,92,246,.15);color:var(--purple);border:1px solid rgba(139,92,246,.3)">做T ${t.advice}</span>` : '';
     return `
     <div class="card" onclick="selectStock('${c.code}');go('analysis')" style="cursor:pointer">
       <div style="display:flex;align-items:center;justify-content:space-between">
         <div style="display:flex;align-items:center;gap:10px">
           <div class="rank ${i<3?'top':''}">${i+1}</div>
           <div>
-            <div class="stock-name">${c.name||c.code}(${c.code}) <span class="badge buy">埋伏</span></div>
+            <div class="stock-name">${c.name||c.code}(${c.code}) <span class="badge buy">埋伏</span> ${tBadge}</div>
             <div class="stock-code">入场 ${fmt(c.launch_point)} · 止损 ${fmt(c.stop_loss)}</div>
           </div>
         </div>
@@ -192,19 +195,8 @@ function renderRadar(){
 
 function renderAnalysis(){
   const c = selectedStock || candidates[0];
-  if(!c) return `<div class="loading">请先从机会雷达选择一只股票</div>`;
-  return `
-    <div class="card">
-      <div class="card-title">
-        <div class="t"><span class="dot"></span>${c.name||c.code}(${c.code})</div>
-        <span class="badge buy">埋伏信号</span>
-      </div>
-      <div style="display:flex;justify-content:space-between;margin-bottom:10px">
-        <div class="up" style="font-size:26px;font-weight:700">${fmt(c.last_price)}</div>
-        <div style="text-align:right"><div class="score">${fmt(c.score,0)}</div><div class="score-l">质量分</div></div>
-      </div>
-      <div id="kline"></div>
-    </div>
+  if(!c) return `<div class="loading">请先从机会雷达或做T信号页选择一只股票</div>`;
+  const plan = c.launch_point ? `
     <div class="card">
       <div class="card-title"><div class="t"><span class="dot"></span>交易计划</div></div>
       <div class="row"><span class="sub">入场点</span><b>${fmt(c.launch_point)}</b></div>
@@ -212,7 +204,22 @@ function renderAnalysis(){
       <div class="row"><span class="sub">目标位1 (+5%)</span><b class="up">${fmt(c.target_1)}</b></div>
       <div class="row"><span class="sub">目标位2 (+10%)</span><b class="up">${fmt(c.target_2)}</b></div>
       <div class="row"><span class="sub">目标位3 (+15%)</span><b class="up">${fmt(c.target_3)}</b></div>
+    </div>` : '';
+  const score = c.score!=null ? `<div style="text-align:right"><div class="score">${fmt(c.score,0)}</div><div class="score-l">质量分</div></div>` : '';
+  const price = c.last_price!=null ? `<div class="up" style="font-size:26px;font-weight:700">${fmt(c.last_price)}</div>` : '<div class="sub">该股票非当日候选，无埋伏计划</div>';
+  return `
+    <div class="card">
+      <div class="card-title">
+        <div class="t"><span class="dot"></span>${c.name||c.code}(${c.code})</div>
+        ${c.launch_point?'<span class="badge buy">埋伏信号</span>':''}
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-bottom:10px">
+        ${price}
+        ${score}
+      </div>
+      <div id="kline"></div>
     </div>
+    ${plan}
     <div id="t-strategy-area"><div class="loading">加载做T分析...</div></div>`;
 }
 
@@ -274,6 +281,63 @@ async function initKline(){
 
 let tMinChart = null;
 
+// 历史数据的VWAP曾因单位错误（成交额元/成交量手）放大100倍，这里做兼容换算
+function normalizeTData(ts){
+  const signals=JSON.parse(ts.signals||'[]');
+  const leaders=JSON.parse(ts.leaders||'[]');
+  const minKline=JSON.parse(ts.min_kline||'[]');
+  if(!minKline.length) return {signals,leaders,minKline,vwap:ts.vwap,vwapSeries:[],advice:ts.advice,confidence:ts.confidence};
+
+  const closes=minKline.map(k=>k.c);
+  const highs=minKline.map(k=>k.h);
+  const lows=minKline.map(k=>k.l);
+  const vols=minKline.map(k=>k.v);
+  const maxP=Math.max(...highs), minP=Math.min(...lows);
+
+  // 用典型价×成交量累计回归VWAP（成交额缺失时的近似）
+  let cumPV=0,cumV=0;
+  const proxy=minKline.map(k=>{
+    const tp=((k.h||k.c)+(k.l||k.c)+(k.c||0))/3;
+    cumPV+=(tp||0)*(k.v||0); cumV+=(k.v||0);
+    return cumV>0?cumPV/cumV:null;
+  });
+
+  const storedSeries=minKline.map(k=>k.vwap);
+  const storedSane=storedSeries.every(v=>v==null||(v>=minP*0.7&&v<=maxP*1.3));
+  let vwapSeries=storedSane?storedSeries:proxy;
+  let vwap=storedSane?ts.vwap:(proxy[proxy.length-1]||ts.vwap);
+
+  let outSignals=signals;
+  if(!storedSane){
+    // 旧数据：丢弃基于错误VWAP的信号，用换算后的VWAP重算
+    outSignals=signals.filter(s=>s.indicator!=='VWAP').slice();
+    const start=Math.max(1,minKline.length-6);
+    for(let i=start;i<minKline.length;i++){
+      const vw=vwapSeries[i], c=closes[i];
+      if(!vw||!c) continue;
+      const dev=(c-vw)/vw*100;
+      if(dev<-0.5) outSignals.push({time:minKline[i].t,type:'买入',reason:`价格低于VWAP ${Math.abs(dev).toFixed(1)}%`,indicator:'VWAP'});
+      else if(dev>0.5) outSignals.push({time:minKline[i].t,type:'卖出',reason:`价格高于VWAP ${dev.toFixed(1)}%`,indicator:'VWAP'});
+    }
+  }
+
+  const buys=outSignals.filter(s=>s.type==='买入');
+  const sells=outSignals.filter(s=>s.type==='卖出');
+  // 按共振指标数计，避免同一指标多根K线重复计数抬高置信度
+  const buyCount=new Set(buys.map(s=>s.indicator)).size;
+  const sellCount=new Set(sells.map(s=>s.indicator)).size;
+  let advice=ts.advice,confidence=ts.confidence;
+  if(!storedSane){
+    if(buyCount>=3){advice='建议做T买入';confidence='高';}
+    else if(buyCount>=2){advice='可考虑做T买入';confidence='中';}
+    else if(sellCount>=3){advice='建议做T卖出';confidence='高';}
+    else if(sellCount>=2){advice='可考虑做T卖出';confidence='中';}
+    else if(buyCount>0&&sellCount>0){advice='信号矛盾，建议观望';confidence='低';}
+    else{advice='信号不足，继续观察';confidence='低';}
+  }
+  return {signals:outSignals,leaders,minKline,vwap,vwapSeries,advice,confidence};
+}
+
 async function loadTStrategy(code){
   try{
     const {data}=await sb.from('t_strategy').select('*').eq('code',code).order('trade_date',{ascending:false}).limit(1);
@@ -289,12 +353,9 @@ async function renderTStrategy(){
   const ts = await loadTStrategy(c.code);
   if(!ts){area.innerHTML='<div class="card"><div class="card-title"><div class="t"><span class="dot" style="background:var(--purple);box-shadow:0 0 8px var(--purple)"></span>做T分析</div></div><div class="sub" style="text-align:center;padding:20px">暂无做T数据，将在下次脚本运行后生成<br>请确保该股票已加入自选股</div></div>';return;}
 
-  const signals=JSON.parse(ts.signals||'[]');
-  const leaders=JSON.parse(ts.leaders||'[]');
-  const minKline=JSON.parse(ts.min_kline||'[]');
+  const {signals,leaders,minKline,vwap,vwapSeries,advice,confidence}=normalizeTData(ts);
 
-  const confColor=ts.confidence==='高'?'var(--up)':ts.confidence==='中'?'var(--gold)':'var(--sub)';
-  const advColor=ts.advice.includes('买入')?'var(--up)':ts.advice.includes('卖出')?'var(--down)':'var(--sub)';
+  const advColor=advice.includes('买入')?'var(--up)':advice.includes('卖出')?'var(--down)':'var(--sub)';
 
   const sigList=signals.slice(-10).map(s=>{
     const tc=s.type==='买入'?'up':'down';
@@ -305,10 +366,10 @@ async function renderTStrategy(){
 
   area.innerHTML=`
     <div class="card" style="border-color:rgba(139,92,246,.4)">
-      <div class="card-title"><div class="t"><span class="dot" style="background:var(--purple);box-shadow:0 0 8px var(--purple)"></span>做T综合建议</div><span class="badge" style="background:rgba(139,92,246,.15);color:var(--purple);border:1px solid rgba(139,92,246,.3)">置信度: ${ts.confidence}</span></div>
+      <div class="card-title"><div class="t"><span class="dot" style="background:var(--purple);box-shadow:0 0 8px var(--purple)"></span>做T综合建议</div><span class="badge" style="background:rgba(139,92,246,.15);color:var(--purple);border:1px solid rgba(139,92,246,.3)">置信度: ${confidence}</span></div>
       <div style="text-align:center;padding:12px 0">
-        <div style="font-size:24px;font-weight:700;color:${advColor}">${ts.advice}</div>
-        <div class="sub" style="margin-top:4px">VWAP均价 ${ts.vwap}</div>
+        <div style="font-size:24px;font-weight:700;color:${advColor}">${advice}</div>
+        <div class="sub" style="margin-top:4px">VWAP均价 ${fmt(vwap)}</div>
       </div>
     </div>
     <div class="card">
@@ -335,7 +396,7 @@ async function renderTStrategy(){
       tMinChart=echarts.init(el);
       const times=minKline.map(k=>k.t);
       const closes=minKline.map(k=>k.c);
-      const vwaps=minKline.map(k=>k.vwap);
+      const vwaps=vwapSeries;
       const vols=minKline.map(k=>k.v);
       // 信号标注
       const buyPts=signals.filter(s=>s.type==='买入').map(s=>{const idx=times.indexOf(s.time);return idx>=0?{coord:[idx,closes[idx]],symbol:'triangle',symbolSize:10,itemStyle:{color:'#22c55e'},label:{show:false}}:null;}).filter(Boolean);
@@ -454,6 +515,7 @@ function renderReview(){
 
 let watchlist = [];
 let watchScores = {};
+let tSignals = {};
 
 async function loadWatchlist(){
   try{
@@ -464,6 +526,17 @@ async function loadWatchlist(){
     const {data}=await sb.from('stock_scores').select('*').order('score',{ascending:false});
     (data||[]).forEach(s=>{watchScores[s.code]=s;});
   }catch(e){}
+}
+
+async function loadTSignals(){
+  try{
+    const {data:dateRows}=await sb.from('t_strategy').select('trade_date').order('trade_date',{ascending:false}).limit(1);
+    if(!dateRows||!dateRows.length) return;
+    const latest=dateRows[0].trade_date;
+    const {data}=await sb.from('t_strategy').select('*').eq('trade_date',latest);
+    tSignals={};
+    (data||[]).forEach(t=>{tSignals[t.code]=t;});
+  }catch(e){console.error('加载做T信号失败:',e);}
 }
 
 async function addWatchStock(){
@@ -529,10 +602,12 @@ function renderWatchlist(){
     const dimReasons=Object.entries(dims).flatMap(([name,d])=>
       d.reasons.map(r=>`<div style="font-size:11px;color:var(--sub);margin-top:2px">· <b>${name}</b>: ${r}</div>`)
     ).join('');
-    return `<div class="card">
+    const t = tSignals[w.code] ? normalizeTData(tSignals[w.code]) : null;
+    const tBadge = t ? `<span class="badge" style="background:rgba(139,92,246,.15);color:var(--purple);border:1px solid rgba(139,92,246,.3)">做T ${t.advice}</span>` : '';
+    return `<div class="card" onclick="selectStock('${w.code}');go('analysis')" style="cursor:pointer">
       <div style="display:flex;justify-content:space-between;align-items:center">
         <div>
-          <div class="stock-name">${w.name||w.code}</div>
+          <div class="stock-name">${w.name||w.code} ${tBadge}</div>
           <div class="stock-code">${w.code}</div>
         </div>
         <div style="display:flex;align-items:center;gap:10px">
@@ -540,13 +615,13 @@ function renderWatchlist(){
             <div style="font-size:22px;font-weight:700;color:${s?gradeColor(s.grade):'var(--sub)'}">${score}</div>
             <div style="font-size:10px;color:${s?gradeColor(s.grade):'var(--sub)'}">${grade}</div>
           </div>
-          <button onclick="removeWatchStock('${w.code}')" style="background:none;border:1px solid var(--border);color:var(--sub);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer">删除</button>
+          <button onclick="event.stopPropagation();removeWatchStock('${w.code}')" style="background:none;border:1px solid var(--border);color:var(--sub);border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer">删除</button>
         </div>
       </div>
       ${s?`<div class="progress" style="margin-top:8px"><i style="width:${Math.min(s.score,100)}%"></i></div>`:''}
       ${s&&s.summary?`<div style="font-size:11px;color:var(--gold);margin-top:8px;padding:8px;background:var(--card2);border-radius:8px">${s.summary}</div>`:''}
       ${dimBars}
-      <details style="margin-top:8px">
+      <details style="margin-top:8px" onclick="event.stopPropagation()">
         <summary style="font-size:12px;color:var(--brand);cursor:pointer">查看评分依据明细</summary>
         <div style="margin-top:6px">${dimReasons||'<span style="font-size:11px;color:var(--sub)">暂无明细</span>'}</div>
       </details>
@@ -565,6 +640,71 @@ function renderWatchlist(){
 
 function selectStock(code){
   selectedStock = candidates.find(c=>c.code===code)||null;
+  if(!selectedStock){
+    const t = tSignals[code];
+    const w = watchlist.find(x=>x.code===code);
+    const s = watchScores[code];
+    selectedStock = {code, name:(t&&t.name)||(w&&w.name)||(s&&s.name)||code,
+      score:s?s.score:null, last_price:null,
+      launch_point:null, stop_loss:null, target_1:null, target_2:null, target_3:null};
+  }
+}
+
+// 做T信号页
+function tAdviceBadge(advice){
+  if(!advice) return '';
+  const buy = advice.includes('买入');
+  const sell = advice.includes('卖出');
+  const color = buy?'var(--up)':sell?'var(--down)':'var(--sub)';
+  const bg = buy?'rgba(239,68,68,.15)':sell?'rgba(34,197,94,.15)':'rgba(124,141,181,.15)';
+  const border = buy?'rgba(239,68,68,.3)':sell?'rgba(34,197,94,.3)':'rgba(124,141,181,.3)';
+  return `<span class="badge" style="background:${bg};color:${color};border:1px solid ${border}">${advice}</span>`;
+}
+
+function renderTSignals(){
+  const norm=Object.values(tSignals).map(t=>{
+    const n=normalizeTData(t);
+    return {code:t.code,name:t.name,trade_date:t.trade_date,industry:t.industry,
+      advice:n.advice,confidence:n.confidence,vwap:n.vwap,signals:n.signals};
+  });
+  const list=norm.sort((a,b)=>{
+    const ba=(a.advice.includes('买入')?2:0)+(a.confidence==='高'?1:0);
+    const bb=(b.advice.includes('买入')?2:0)+(b.confidence==='高'?1:0);
+    return bb-ba;
+  });
+  if(!list.length){
+    return `<div class="loading">暂无做T信号数据<br><span class="sub">等待交易日脚本运行后生成</span></div>`;
+  }
+  const items=list.map(t=>{
+    const signals=t.signals||[];
+    const buys=signals.filter(s=>s.type==='买入');
+    const sells=signals.filter(s=>s.type==='卖出');
+    const lastReason=(signals[signals.length-1]||{}).reason||'';
+    return `<div class="card" onclick="selectStock('${t.code}');go('analysis')" style="cursor:pointer">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <div class="stock-name">${t.name||t.code} <span class="stock-code">${t.code}</span></div>
+          <div class="stock-code">VWAP ${fmt(t.vwap)} · ${t.industry||'未知行业'}</div>
+        </div>
+        <div style="text-align:right">
+          ${tAdviceBadge(t.advice)}
+          <div class="stock-code" style="margin-top:4px">置信度 ${t.confidence}</div>
+        </div>
+      </div>
+      <div class="stat-grid" style="margin-top:10px">
+        <div class="stat"><div class="v up">${buys.length}</div><div class="l">买入信号</div></div>
+        <div class="stat"><div class="v down">${sells.length}</div><div class="l">卖出信号</div></div>
+        <div class="stat"><div class="v" style="font-size:13px;color:var(--sub);line-height:1.5">${lastReason.slice(0,12)}</div><div class="l">最新信号</div></div>
+      </div>
+    </div>`;
+  }).join('');
+  return `
+    <div class="card" style="border-color:rgba(139,92,246,.4)">
+      <div class="card-title"><div class="t"><span class="dot" style="background:var(--purple);box-shadow:0 0 8px var(--purple)"></span>日内做T信号</div><span class="badge" style="background:rgba(139,92,246,.15);color:var(--purple);border:1px solid rgba(139,92,246,.3)">${list.length}只</span></div>
+      <div class="sub">基于5分钟K线的VWAP/量能/MACD/KDJ/布林带信号，点击卡片查看分时图</div>
+    </div>
+    ${items}
+    <div class="notice">⚠️ 日内做T仅供参考，注意仓位管理和交易成本</div>`;
 }
 
 const CONFIG_FIELDS = [
@@ -633,6 +773,7 @@ async function render(){
   const v = document.getElementById('view');
   if(cur==='radar') v.innerHTML = renderRadar();
   else if(cur==='watchlist') v.innerHTML = renderWatchlist();
+  else if(cur==='tsignals') v.innerHTML = renderTSignals();
   else if(cur==='analysis'){ v.innerHTML = renderAnalysis(); setTimeout(initKline,50); setTimeout(renderTStrategy,200); }
   else if(cur==='review') v.innerHTML = renderReview();
   else if(cur==='settings') v.innerHTML = renderSettings();
@@ -648,6 +789,7 @@ async function init(){
   document.getElementById('view').innerHTML='<div class="loading">正在加载数据...</div>';
   currentConfig = await loadConfig();
   await loadWatchlist();
+  await loadTSignals();
   await loadTracking();
   await loadSignals();
   candidates = await loadCandidates();
