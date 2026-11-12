@@ -99,6 +99,7 @@ const VIEWS = [
   {id:'tsignals',name:'做T信号',icon:'🔄'},
   {id:'analysis',name:'个股分析',icon:'📈'},
   {id:'review',name:'策略复盘',icon:'📊'},
+  {id:'backtest',name:'回测验证',icon:'🧪'},
   {id:'settings',name:'选股设置',icon:'⚙️'},
 ];
 
@@ -617,6 +618,20 @@ function getConcepts(code){
   return c.slice(0,6).map(x=>`<span class="badge" style="background:rgba(56,189,248,.12);color:#38bdf8;border:1px solid rgba(56,189,248,.25);font-size:11px">${x}</span>`).join(' ');
 }
 
+let backtestData = {};
+
+async function loadBacktest(){
+  try{
+    const {data,error}=await sb.from('backtest_result').select('*');
+    if(error){console.error('加载回测结果失败:',error);return;}
+    (data||[]).forEach(r=>{
+      let v=r.value;
+      if(typeof v==='string'){try{v=JSON.parse(v);}catch(e){v=null;}}
+      backtestData[r.key]=v;
+    });
+  }catch(e){console.error('加载回测结果失败:',e);}
+}
+
 async function loadLastRun(){
   try{
     const {data}=await sb.from('config').select('value').eq('key','last_run').limit(1);
@@ -861,6 +876,97 @@ function renderSettings(){
     <div class="notice">修改参数后需手动触发 GitHub Actions 或等待每日自动运行<br>参数越宽松，候选股票越多，但信号质量可能降低</div>`;
 }
 
+function btCell(c){
+  if(!c||!c.n) return '<div class="sub">--</div>';
+  const wr=c.win_rate>=50?'var(--up)':'var(--down)';
+  return `<div class="stat"><div class="v ${c.avg>=0?'up':'down'}">${c.avg>=0?'+':''}${c.avg}%</div><div class="l">胜率 <b style="color:${wr}">${c.win_rate}%</b> · ${c.n}次</div></div>`;
+}
+
+function renderBacktest(){
+  const t=backtestData['t_signal'];
+  const s=backtestData['screening'];
+  if(!t&&!s){
+    return `<div class="loading">暂无回测数据<br><span class="sub">等待脚本运行后生成（需要先积累几天信号样本）</span></div>`;
+  }
+
+  const hLabel={h1:'后1根(30分钟)',h3:'后3根(1.5小时)',h6:'后6根(3小时)'};
+  const sLabel={h5:'入选后5日',h10:'入选后10日',h20:'入选后20日'};
+
+  let tHtml='<div class="sub">暂无做T信号回测数据</div>';
+  if(t&&t.samples){
+    const all=t.groups['全部']||{};
+    const byInd=t.groups['指标']||{};
+    const indRows=Object.entries(byInd).sort((a,b)=>(b[1].h3?.n||0)-(a[1].h3?.n||0)).map(([k,v])=>`
+      <div class="card" style="background:var(--card2)">
+        <div style="display:flex;justify-content:space-between"><b style="font-size:13px">${k}</b><span class="sub">${v.h3?`${v.h3.n}次` : (v.h1?`${v.h1.n}次`:'')}</span></div>
+        <div class="stat-grid" style="margin-top:6px">
+          ${btCell(v.h1)}${btCell(v.h3)}${btCell(v.h6)}
+        </div>
+      </div>`).join('');
+    tHtml=`
+      <div class="card" style="border-color:rgba(34,197,94,.35)">
+        <div class="card-title"><div class="t"><span class="dot" style="background:var(--up)"></span>做T信号回测</div><span class="sub">${t.samples}个信号 · 成本${t.cost}%</span></div>
+        <div class="sub" style="margin-bottom:8px">统计每个信号发出后，价格在 1/3/6 根30分钟K线内的净收益（已扣交易成本），胜率=扣除成本后方向正确占比</div>
+        <div class="stat-grid">
+          ${btCell(all.h1)}${btCell(all.h3)}${btCell(all.h6)}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title"><div class="t"><span class="dot"></span>分指标表现</div><span class="sub">看哪个指标最准</span></div>
+        ${indRows||'<div class="sub">样本不足</div>'}
+      </div>`;
+  }
+
+  let sHtml='<div class="sub">暂无选股回测数据</div>';
+  if(s&&s.samples){
+    const groups=s.groups||{};
+    const keys=Object.keys(groups).filter(k=>k!=='全部');
+    const rows=keys.map(k=>{
+      const v=groups[k];
+      return `<tr><td style="padding:6px 8px;font-size:12px">${k}</td>
+        <td style="padding:6px 8px;text-align:right">${v.h5?v.h5.n:'--'}</td>
+        <td style="padding:6px 8px;text-align:right;color:${v.h5&&v.h5.win_rate>=50?'var(--up)':'var(--down)'}">${v.h5?v.h5.win_rate+'%':'--'}</td>
+        <td style="padding:6px 8px;text-align:right">${v.h10?v.h10.n:'--'}</td>
+        <td style="padding:6px 8px;text-align:right;color:${v.h10&&v.h10.win_rate>=50?'var(--up)':'var(--down)'}">${v.h10?v.h10.win_rate+'%':'--'}</td>
+        <td style="padding:6px 8px;text-align:right">${v.h20?v.h20.n:'--'}</td>
+        <td style="padding:6px 8px;text-align:right;color:${v.h20&&v.h20.win_rate>=50?'var(--up)':'var(--down)'}">${v.h20?v.h20.win_rate+'%':'--'}</td>
+        <td style="padding:6px 8px;text-align:right" class="${v.h20&&v.h20.avg>=0?'up':'down'}">${v.h20?v.h20.avg+'%':'--'}</td></tr>`;
+    }).join('');
+    const all=groups['全部']||{};
+    sHtml=`
+      <div class="card" style="border-color:rgba(56,189,248,.35)">
+        <div class="card-title"><div class="t"><span class="dot" style="background:#38bdf8"></span>选股策略回测</div><span class="sub">${s.samples}只 · 成本${s.cost}%</span></div>
+        <div class="stat-grid">
+          ${btCell(all.h5)}${btCell(all.h10)}${btCell(all.h20)}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title"><div class="t"><span class="dot"></span>分组表现</div><span class="sub">找出最优参数区间</span></div>
+        <div style="overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+          <thead><tr style="color:var(--sub);font-size:11px">
+            <th style="text-align:left;padding:6px 8px">分组</th>
+            <th style="text-align:right;padding:6px 8px">5日样本</th>
+            <th style="text-align:right;padding:6px 8px">5日胜率</th>
+            <th style="text-align:right;padding:6px 8px">10日样本</th>
+            <th style="text-align:right;padding:6px 8px">10日胜率</th>
+            <th style="text-align:right;padding:6px 8px">20日样本</th>
+            <th style="text-align:right;padding:6px 8px">20日胜率</th>
+            <th style="text-align:right;padding:6px 8px">20日均值</th>
+          </tr></thead>
+          <tbody>${rows||'<tr><td colspan="8" class="sub">样本不足</td></tr>'}</tbody>
+        </table>
+        </div>
+        <div class="sub" style="margin-top:8px">分组维度：入选当日涨幅区间 / 评分区间 / 回踩天数 / 所属概念。样本 ≥20 的分组才可信。</div>
+      </div>`;
+  }
+
+  return `
+    ${tHtml}
+    ${sHtml}
+    <div class="notice">⚠️ 回测基于实际信号的前瞻统计，不含未来函数；样本量小于30时胜率波动很大，仅供调参参考</div>`;
+}
+
 function renderBanner(){
   if(!lastRun) return '';
   const stale=lastRun.stale;
@@ -890,6 +996,7 @@ async function render(){
   else if(cur==='tsignals') v.innerHTML = banner+renderTSignals();
   else if(cur==='analysis'){ v.innerHTML = banner+renderAnalysis(); setTimeout(initKline,50); setTimeout(renderTStrategy,200); }
   else if(cur==='review') v.innerHTML = banner+renderReview();
+  else if(cur==='backtest') v.innerHTML = banner+renderBacktest();
   else if(cur==='settings') v.innerHTML = banner+renderSettings();
   window.scrollTo(0,0);
 }
@@ -903,6 +1010,7 @@ async function init(){
   document.getElementById('view').innerHTML='<div class="loading">正在加载数据...</div>';
   currentConfig = await loadConfig();
   await loadLastRun();
+  await loadBacktest();
   await loadConcepts();
   await loadWatchlist();
   await loadTSignals();

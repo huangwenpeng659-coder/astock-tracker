@@ -118,6 +118,38 @@ create table if not exists stock_concepts (
   concepts jsonb
 );
 
+-- ---------- 分钟K线（仅30分钟级、仅自选+候选股，滚动保留） ----------
+create table if not exists t_minute (
+  code text not null,
+  trade_date date not null,
+  period text not null default '30',
+  bar_time text not null,          -- '2026-11-12 10:30'
+  open numeric, high numeric, low numeric, close numeric,
+  volume bigint, amount numeric, vwap numeric,
+  primary key (code, trade_date, period, bar_time)
+);
+
+-- ---------- 做T信号快照（信号前后各若干根K，永久保留，供回测） ----------
+create table if not exists t_signal_bars (
+  code text not null,
+  trade_date date not null,
+  signal_time text not null,
+  indicator text not null,
+  signal_type text not null,       -- 买入 / 卖出
+  strength text,
+  signal_price numeric,
+  bars jsonb,                      -- [{t,o,h,l,c,v,vwap}, ...]
+  created_at timestamptz default now(),
+  primary key (code, trade_date, signal_time, indicator, signal_type)
+);
+
+-- ---------- 回测结果（按 key 存 JSON，前端直接渲染） ----------
+create table if not exists backtest_result (
+  key text primary key,
+  value jsonb,
+  updated_at timestamptz default now()
+);
+
 -- ---------- 持仓追踪（可选） ----------
 create table if not exists tracking (
   code text primary key,
@@ -145,6 +177,16 @@ alter table t_strategy add column if not exists plan jsonb;
 alter table t_strategy add column if not exists buy_score numeric;
 alter table t_strategy add column if not exists sell_score numeric;
 alter table t_strategy add column if not exists concepts jsonb;
+
+alter table t_minute enable row level security;
+alter table t_signal_bars enable row level security;
+alter table backtest_result enable row level security;
+drop policy if exists "allow all" on t_minute for all to anon using (true) with check (true);
+drop policy if exists "allow all" on t_signal_bars for all to anon using (true) with check (true);
+drop policy if exists "allow all" on backtest_result for all to anon using (true) with check (true);
+create policy "allow all" on t_minute for all to anon using (true) with check (true);
+create policy "allow all" on t_signal_bars for all to anon using (true) with check (true);
+create policy "allow all" on backtest_result for all to anon using (true) with check (true);
 
 -- ============================================================
 -- RLS + anon 读写策略（前端用 publishable key 直接读写）

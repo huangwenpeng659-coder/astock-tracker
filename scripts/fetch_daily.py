@@ -1091,6 +1091,119 @@ def update_tracking():
         print(f"  补齐概念失败: {e}")
 
 
+# ============ 分钟数据落库（回测用） ============
+# 只落 30分钟K，且只对自选股+候选股落库；滚动保留 keep_days 天
+MIN_KEEP_DAYS = int(os.environ.get("MIN_KEEP_DAYS", "90"))
+SIGNAL_WINDOW = 6  # 信号前后各保留几根K
+
+def _bars_with_vwap(df_min):
+    """给分钟K补上每日累计VWAP，返回 bar 列表"""
+    if df_min is None or df_min.empty:
+        return []
+    df = df_min.copy()
+    df['cum_amount'] = df.groupby('day')['amount'].cumsum()
+    df['cum_volume'] = df.groupby('day')['volume'].cumsum()
+    df['vwap'] = df['cum_amount'] / (df['cum_volume'] * 100)
+    out = []
+    for _, r in df.iterrows():
+        out.append({
+            't': r['time'],
+            'd': r['day'],
+            'o': round(float(r['open']), 3),
+            'h': round(float(r['high']), 3),
+            'l': round(float(r['low']), 3),
+            'c': round(float(r['close']), 3),
+            'v': int(r['volume']),
+            'vwap': round(float(r['vwap']), 3) if pd.notna(r['vwap']) else None,
+        })
+    return out
+
+def save_min_bars(code, df_min, period='30'):
+    """分钟K落库（滚动窗口），返回写入行数"""
+    bars = _bars_with_vwap(df_min)
+    if not bars:
+        return 0
+    rows = [{
+        'code': code, 'trade_date': b['d'], 'period': period, 'bar_time': b['t'],
+        'open': b['o'], 'high': b['h'], 'low': b['l'], 'close': b['c'],
+        'volume': b['v'], 'amount': None, 'vwap': b['vwap'],
+    } for b in bars]
+    try:
+        for i in range(0, len(rows), 200):
+            supabase.table('t_minute').upsert(rows[i:i + 200],
+                                              on_conflict='code,trade_date,period,bar_time').execute()
+    except Exception as e:
+        print(f"  分钟K落库失败 {code}: {e}")
+        return 0
+    return len(rows)
+
+def prune_min_bars(keep_days=MIN_KEEP_DAYS):
+    cutoff = (now_cn() - timedelta(days=keep_days)).strftime('%Y-%m-%d')
+    try:
+        supabase.table('t_minute').delete().lt('trade_date', cutoff).execute()
+    except Exception as e:
+        print(f"  清理分钟K失败: {e}")
+
+def save_signal_snapshots(code, df_min, signals, period='30'):
+    """保存信号前后窗口K线快照；历史信号会在后续交易日被再次刷新（补上未来的K线）"""
+    bars = _bars_with_vwap(df_min)
+    if not bars:
+        return 0
+    idx_by_time = {b['t']: i for i, b in enumerate(bars)}
+    rows = []
+    for sg in signals or []:
+        t = sg.get('time')
+        i = idx_by_time.get(t)
+        if i is None:
+            continue
+        lo = max(0, i - SIGNAL_WINDOW)
+        hi = min(len(bars), i + SIGNAL_WINDOW + 1)
+        win = bars[lo:hi]
+        rows.append({
+            'code': code,
+            'trade_date': bars[i]['d'],
+            'signal_time': t,
+            'indicator': sg.get('indicator', ''),
+            'signal_type': sg.get('type', ''),
+            'strength': sg.get('strength', ''),
+            'signal_price': sg.get('price'),
+            'bars': json.dumps({'sig_idx': i - lo, 'bars': win}, ensure_ascii=False),
+        })
+    # 刷新历史信号（补上信号之后的K线，才能算前瞻收益）
+    try:
+        hist = supabase.table('t_signal_bars').select('*').eq('code', code).execute().data or []
+        for h in hist:
+            t = h.get('signal_time')
+            i = idx_by_time.get(t)
+            if i is None:
+                continue
+            lo = max(0, i - SIGNAL_WINDOW)
+            hi = min(len(bars), i + SIGNAL_WINDOW + 1)
+            win = bars[lo:hi]
+            rows.append({
+                'code': code, 'trade_date': bars[i]['d'], 'signal_time': t,
+                'indicator': h.get('indicator', ''), 'signal_type': h.get('signal_type', ''),
+                'strength': h.get('strength', ''), 'signal_price': h.get('signal_price'),
+                'bars': json.dumps({'sig_idx': i - lo, 'bars': win}, ensure_ascii=False),
+            })
+    except Exception as e:
+        print(f"  读取历史信号失败 {code}: {e}")
+
+    if not rows:
+        return 0
+    # 同一主键可能重复（历史刷新 + 新增），去重
+    seen = {}
+    for r in rows:
+        seen[(r['code'], r['trade_date'], r['signal_time'], r['indicator'], r['signal_type'])] = r
+    uniq = list(seen.values())
+    try:
+        supabase.table('t_signal_bars').upsert(uniq,
+            on_conflict='code,trade_date,signal_time,indicator,signal_type').execute()
+    except Exception as e:
+        print(f"  信号快照保存失败 {code}: {e}")
+        return 0
+    return len(uniq)
+
 def run_t_analysis(code, name, trade_date):
     try:
         name = get_stock_name(code, name)
@@ -1105,6 +1218,9 @@ def run_t_analysis(code, name, trade_date):
         if t_result:
             save_t_strategy(code, name, trade_date, industry, t_result, concepts)
             save_stock_concepts(code, name, concepts)
+            # 分钟K与信号快照落库（供回测）
+            save_min_bars(code, min_df, '30')
+            save_signal_snapshots(code, min_df, t_result['signals'], '30')
     except Exception as e:
         print(f"  {name}({code}) 做T分析异常: {e}")
 
@@ -1255,6 +1371,9 @@ def main():
     # 更新历史追踪
     update_tracking()
     print(f"追踪更新耗时 {elapsed()}")
+
+    prune_min_bars()
+    print(f"分钟K清理完成（保留{MIN_KEEP_DAYS}天），总耗时 {elapsed()}")
 
     # --- 数据时效性检查 + 运行状态上报 ---
     data_date = latest_data_date or '未知'

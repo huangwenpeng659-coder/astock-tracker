@@ -38,3 +38,11 @@ jobs:
           TZ: Asia/Shanghai
         run: |
           python scripts/fetch_daily.py
+
+      - name: 运行策略回测
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TZ: Asia/Shanghai
+        run: |
+          python scripts/backtest.py
