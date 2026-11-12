@@ -612,12 +612,15 @@ async function loadTSignals(){
 
 async function loadConcepts(){
   try{
-    const {data,error}=await sb.from('stock_concepts').select('code,concepts');
+    const {data,error}=await sb.from('config').select('key,value');
     if(error){console.error('加载概念失败:',error);return;}
     (data||[]).forEach(r=>{
-      let v=r.concepts;
-      v=safeParse(v,[]);
-      conceptMap[r.code]=Array.isArray(v)?v:[];
+      const k=r.key||'';
+      if(!k.startsWith('concepts:')) return;
+      const code=k.split(':')[1];
+      const payload=safeParse(r.value,{});
+      const v=payload&&payload.concepts?payload.concepts:[];
+      conceptMap[code]=Array.isArray(v)?v:[];
     });
   }catch(e){console.error('加载概念失败:',e);}
 }
@@ -631,12 +634,12 @@ let backtestData = {};
 
 async function loadBacktest(){
   try{
-    const {data,error}=await sb.from('backtest_result').select('*');
+    const {data,error}=await sb.from('config').select('key,value');
     if(error){console.error('加载回测结果失败:',error);return;}
     (data||[]).forEach(r=>{
-      let v=r.value;
-      v=safeParse(v,null);
-      backtestData[r.key]=v;
+      const k=r.key||'';
+      if(k!=='backtest_t'&&k!=='backtest_s') return;
+      backtestData[k==='backtest_t'?'t_signal':'screening']=safeParse(r.value,null);
     });
   }catch(e){console.error('加载回测结果失败:',e);}
 }

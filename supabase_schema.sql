@@ -118,7 +118,9 @@ create table if not exists stock_concepts (
   concepts jsonb
 );
 
--- ---------- 分钟K线（仅30分钟级、仅自选+候选股，滚动保留） ----------
+-- ---------- 分钟K线（可选表） ----------
+-- 说明：分钟K、信号快照、概念、回测结果现在统一存在已有的 config 表里（KV 存储），
+--       因此下面这些表不是必需的。想要用独立表存储可在执行后把代码切回去。
 create table if not exists t_minute (
   code text not null,
   trade_date date not null,

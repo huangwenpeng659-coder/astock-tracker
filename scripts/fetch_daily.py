@@ -244,17 +244,10 @@ def get_stock_concepts(code):
     return concepts[:12]
 
 def save_stock_concepts(code, name, concepts):
-    """概念写入 stock_concepts 表（前端按需查询，不改动已有表结构）"""
+    """概念写入 config KV（键 concepts:<code>），无需新建表"""
     if not concepts:
         return
-    if not table_exists('stock_concepts'):
-        return
-    try:
-        supabase.table('stock_concepts').upsert({
-            'code': code, 'name': name, 'concepts': json.dumps(concepts, ensure_ascii=False)
-        }, on_conflict='code').execute()
-    except Exception as e:
-        print(f"  保存概念失败 {code}: {e}")
+    kv_set(f'concepts:{code}', {'name': name, 'concepts': concepts})
 
 def save_stock_basic(code, name):
     try:
@@ -1062,6 +1055,34 @@ def update_tracking():
         print(f"  补齐概念失败: {e}")
 
 
+# ============ 通用 KV 存储（复用已有的 config 表） ============
+# 键值约定：min_bars:<code> / sig_bars:<code> / concepts:<code> / backtest_t / backtest_s
+def kv_get(key):
+    try:
+        resp = supabase.table('config').select('value').eq('key', key).limit(1).execute()
+        rows = resp.data or []
+        if not rows:
+            return None
+        v = rows[0].get('value')
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except Exception:
+                return None
+        return v
+    except Exception:
+        return None
+
+def kv_set(key, value):
+    try:
+        supabase.table('config').upsert(
+            {'key': key, 'value': json.dumps(value, ensure_ascii=False)},
+            on_conflict='key').execute()
+        return True
+    except Exception as e:
+        print(f"  KV写入失败 {key}: {e}")
+        return False
+
 # ============ 分钟数据落库（回测用） ============
 # 表不存在时跳过相关写入，避免每次运行刷几百行错误
 _missing_tables = set()
@@ -1108,96 +1129,74 @@ def _bars_with_vwap(df_min):
     return out
 
 def save_min_bars(code, df_min, period='30'):
-    """分钟K落库（滚动窗口），返回写入行数"""
-    if not table_exists('t_minute'):
-        return 0
+    """分钟K落库到 config KV（键 min_bars:<code>），滚动保留 MIN_KEEP_DAYS 天"""
     bars = _bars_with_vwap(df_min)
     if not bars:
         return 0
-    rows = [{
-        'code': code, 'trade_date': b['d'], 'period': period, 'bar_time': b['t'],
-        'open': b['o'], 'high': b['h'], 'low': b['l'], 'close': b['c'],
-        'volume': b['v'], 'amount': None, 'vwap': b['vwap'],
-    } for b in bars]
-    try:
-        for i in range(0, len(rows), 200):
-            supabase.table('t_minute').upsert(rows[i:i + 200],
-                                              on_conflict='code,trade_date,period,bar_time').execute()
-    except Exception as e:
-        print(f"  分钟K落库失败 {code}: {e}")
-        return 0
-    return len(rows)
+    cutoff = (now_cn() - timedelta(days=MIN_KEEP_DAYS)).strftime('%Y-%m-%d')
+    bars = [b for b in bars if b['d'] >= cutoff]
+    old = kv_get(f'min_bars:{code}') or {}
+    merged = {}
+    for b in (old.get('bars') or []) + bars:
+        merged[b['t']] = b
+    kept = sorted(merged.values(), key=lambda x: x['t'])[-800:]
+    if kv_set(f'min_bars:{code}', {'period': period, 'bars': kept,
+                                   'updated_at': now_cn().strftime('%Y-%m-%d %H:%M:%S')}):
+        return len(kept)
+    return 0
 
 def prune_min_bars(keep_days=MIN_KEEP_DAYS):
-    if not table_exists('t_minute'):
-        return
-    cutoff = (now_cn() - timedelta(days=keep_days)).strftime('%Y-%m-%d')
-    try:
-        supabase.table('t_minute').delete().lt('trade_date', cutoff).execute()
-    except Exception as e:
-        print(f"  清理分钟K失败: {e}")
+    """分钟K已按日期滚动过滤（save_min_bars 内部），这里无需额外清理"""
+    return
 
 def save_signal_snapshots(code, df_min, signals, period='30'):
-    """保存信号前后窗口K线快照；历史信号会在后续交易日被再次刷新（补上未来的K线）"""
-    if not table_exists('t_signal_bars'):
-        return 0
+    """信号窗口K线快照存 config KV（键 sig_bars:<code>）
+    历史信号会在后续交易日被再次刷新，补上信号之后的K线，才能算前瞻收益"""
     bars = _bars_with_vwap(df_min)
     if not bars:
         return 0
     idx_by_time = {b['t']: i for i, b in enumerate(bars)}
-    rows = []
-    for sg in signals or []:
-        t = sg.get('time')
+
+    old = kv_get(f'sig_bars:{code}') or {}
+    existing = {}
+    for item in (old.get('signals') or []):
+        k = f"{item.get('signal_time')}|{item.get('indicator')}|{item.get('signal_type')}"
+        existing[k] = item
+
+    def build(t, indicator, stype, strength, price):
         i = idx_by_time.get(t)
         if i is None:
-            continue
+            return None
         lo = max(0, i - SIGNAL_WINDOW)
         hi = min(len(bars), i + SIGNAL_WINDOW + 1)
-        win = bars[lo:hi]
-        rows.append({
-            'code': code,
-            'trade_date': bars[i]['d'],
+        return {
             'signal_time': t,
-            'indicator': sg.get('indicator', ''),
-            'signal_type': sg.get('type', ''),
-            'strength': sg.get('strength', ''),
-            'signal_price': sg.get('price'),
-            'bars': json.dumps({'sig_idx': i - lo, 'bars': win}, ensure_ascii=False),
-        })
-    # 刷新历史信号（补上信号之后的K线，才能算前瞻收益）
-    try:
-        hist = supabase.table('t_signal_bars').select('*').eq('code', code).execute().data or []
-        for h in hist:
-            t = h.get('signal_time')
-            i = idx_by_time.get(t)
-            if i is None:
-                continue
-            lo = max(0, i - SIGNAL_WINDOW)
-            hi = min(len(bars), i + SIGNAL_WINDOW + 1)
-            win = bars[lo:hi]
-            rows.append({
-                'code': code, 'trade_date': bars[i]['d'], 'signal_time': t,
-                'indicator': h.get('indicator', ''), 'signal_type': h.get('signal_type', ''),
-                'strength': h.get('strength', ''), 'signal_price': h.get('signal_price'),
-                'bars': json.dumps({'sig_idx': i - lo, 'bars': win}, ensure_ascii=False),
-            })
-    except Exception as e:
-        print(f"  读取历史信号失败 {code}: {e}")
+            'trade_date': bars[i]['d'],
+            'indicator': indicator,
+            'signal_type': stype,
+            'strength': strength,
+            'signal_price': price,
+            'sig_idx': i - lo,
+            'bars': bars[lo:hi],
+        }
 
-    if not rows:
-        return 0
-    # 同一主键可能重复（历史刷新 + 新增），去重
-    seen = {}
-    for r in rows:
-        seen[(r['code'], r['trade_date'], r['signal_time'], r['indicator'], r['signal_type'])] = r
-    uniq = list(seen.values())
-    try:
-        supabase.table('t_signal_bars').upsert(uniq,
-            on_conflict='code,trade_date,signal_time,indicator,signal_type').execute()
-    except Exception as e:
-        print(f"  信号快照保存失败 {code}: {e}")
-        return 0
-    return len(uniq)
+    for item in existing.values():
+        fresh = build(item.get('signal_time'), item.get('indicator', ''), item.get('signal_type', ''),
+                      item.get('strength', ''), item.get('signal_price'))
+        if fresh:
+            existing[f"{fresh['signal_time']}|{fresh['indicator']}|{fresh['signal_type']}"] = fresh
+
+    for sg in signals or []:
+        fresh = build(sg.get('time'), sg.get('indicator', ''), sg.get('type', ''),
+                      sg.get('strength', ''), sg.get('price'))
+        if fresh:
+            existing[f"{fresh['signal_time']}|{fresh['indicator']}|{fresh['signal_type']}"] = fresh
+
+    items = sorted(existing.values(), key=lambda x: x.get('signal_time', ''))[-300:]
+    if kv_set(f'sig_bars:{code}', {'signals': items,
+                                   'updated_at': now_cn().strftime('%Y-%m-%d %H:%M:%S')}):
+        return len(items)
+    return 0
 
 def run_t_analysis(code, name, trade_date):
     try:

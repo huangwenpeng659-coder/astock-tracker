@@ -1,10 +1,10 @@
 """
 策略回测引擎
-1) 做T信号回测：用 t_signal_bars 的信号窗口快照，统计信号后 1/3/6 根30分钟K的胜率与收益（按指标/强度分组）
+1) 做T信号回测：用 config KV 里的信号窗口快照(sig_bars:<code>)，统计信号后 1/3/6 根30分钟K的胜率与收益（按指标/强度分组）
 2) 选股回测：用 candidates + daily_kline，统计入选后 5/10/20 日的胜率与收益（按评分/概念分组）
 
 成本模型：佣金万2.5双边(约0.05%) + 卖出印花税千1(0.1%) => 单次做T往返约 0.2%
-运行：python scripts/backtest.py（写回 Supabase backtest_result 表）
+运行：python scripts/backtest.py（结果写入 config 表，键 backtest_t / backtest_s）
 """
 import os
 import json
@@ -67,15 +67,40 @@ def table_exists(table):
         return True
 
 
-def backtest_t_signals():
-    if not table_exists('t_signal_bars'):
-        return {'samples': 0, 'note': 't_signal_bars 表不存在，请先执行 supabase_schema.sql'}
+def fetch_all_kv(prefix):
+    """读取 config 中所有以 prefix 开头的键，合并 value"""
+    out = {}
     try:
-        rows = fetch_all('t_signal_bars')
+        cfg = fetch_all('config', select='key,value')
     except Exception as e:
-        return {'samples': 0, 'note': f'读取信号快照失败: {e}'}
+        print(f"  读取config失败: {e}")
+        return out
+    for row in cfg:
+        k = row.get('key') or ''
+        if not k.startswith(prefix):
+            continue
+        v = row.get('value')
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except Exception:
+                continue
+        out[k] = v or {}
+    return out
+
+
+def backtest_t_signals():
+    kv = fetch_all_kv('sig_bars:')
+    rows = []
+    for code, payload in kv.items():
+        for item in (payload.get('signals') or []):
+            r = dict(item)
+            r['code'] = code
+            r['bars'] = json.dumps({'sig_idx': r.get('sig_idx', 0), 'bars': r.get('bars') or []},
+                                   ensure_ascii=False)
+            rows.append(r)
     if not rows:
-        return {'samples': 0, 'note': '暂无信号快照数据'}
+        return {'samples': 0, 'note': '暂无信号快照数据（需要先跑几天脚本积累）'}
 
     horizons = [1, 3, 6]
     # key: 维度 -> 指标 -> 统计
@@ -181,18 +206,10 @@ def backtest_screening():
 
     # 概念映射
     concepts = {}
-    try:
-        concept_rows = fetch_all('stock_concepts', select='code,concepts') if table_exists('stock_concepts') else []
-    except Exception:
-        concept_rows = []
-    for c in concept_rows:
-        v = c.get('concepts')
-        if isinstance(v, str):
-            try:
-                v = json.loads(v)
-            except Exception:
-                v = []
-        concepts[c['code']] = v or []
+    for k, payload in fetch_all_kv('concepts:').items():
+        code = k.split(':', 1)[1]
+        v = payload.get('concepts') if isinstance(payload, dict) else payload
+        concepts[code] = v or []
 
     horizons = [5, 10, 20]
     groups = {}
@@ -284,9 +301,8 @@ def backtest_screening():
 
 def save_result(key, value):
     try:
-        supabase.table('backtest_result').upsert({
-            'key': key, 'value': json.dumps(value, ensure_ascii=False),
-            'updated_at': now_cn().strftime('%Y-%m-%d %H:%M:%S')
+        supabase.table('config').upsert({
+            'key': key, 'value': json.dumps(value, ensure_ascii=False)
         }, on_conflict='key').execute()
         print(f"  已写入回测结果: {key}")
     except Exception as e:
