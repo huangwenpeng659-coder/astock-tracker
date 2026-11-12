@@ -1,0 +1,5 @@
+akshare==1.18.19
+supabase==2.20.0
+pandas>=2.2,<3.0
+numpy>=1.26,<3
+requests>=2.32

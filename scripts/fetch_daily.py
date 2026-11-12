@@ -33,6 +33,9 @@ supabase = create_client(
 # mode: "indices" = 按指数成分股, "top_n" = 市值前N, "static" = 固定列表
 # indices: 逗号分隔的指数代码 (000300=沪深300, 000016=上证50, 000905=中证500)
 # top_n: 市值前N只
+# 并发线程数：新浪/东财对高频请求敏感，8线程是比较稳的上限
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))
+
 POOL_CONFIG = {
     "mode": os.environ.get("STOCK_POOL_MODE", "indices"),
     "indices": os.environ.get("STOCK_POOL_INDICES", "000300").split(","),
@@ -1116,6 +1119,10 @@ def run_t_analysis_batch(stocks, trade_date, max_workers=6, label="股票"):
 
 
 def main():
+    t_start = time.time()
+    def elapsed():
+        return f"{time.time() - t_start:.0f}s"
+
     params = load_config()
     now = now_cn()
     today = now.strftime("%Y-%m-%d")
@@ -1144,61 +1151,110 @@ def main():
                 save_analysis(code, name, today, result)
                 print(f"  {name}({code}): {result['score']}分 [{result['grade']}]")
             t_targets.append({'code': code, 'name': name})
+        print(f"  自选股评分耗时 {elapsed()}")
         run_t_analysis_batch(t_targets, today, label="自选股")
+        print(f"  自选股做T分析耗时 {elapsed()}")
 
-    # --- 全池选股 ---
+    # --- 全池选股（并发抓取，串行会浪费 90% 时间在等待网络） ---
     stock_pool = get_dynamic_stock_pool()
-    print(f"\n开始抓取 A股数据（共{len(stock_pool)}只）...")
+    print(f"\n开始抓取 A股数据（共{len(stock_pool)}只，{MAX_WORKERS}线程并发）...")
     candidates = []
     success_count = 0
     latest_data_date = None
+    done_count = [0]
 
-    for idx, (code, pool_name) in enumerate(stock_pool):
-        name = get_stock_name(code, pool_name)
-        save_stock_basic(code, name)
+    def _screen(item):
+        """单只股票的抓取+检测，返回候选/信号，供主线程汇总"""
+        code, pool_name = item
+        try:
+            name = get_stock_name(code, pool_name)
+            save_stock_basic(code, name)
+            df = fetch_and_save_kline(code)
+            if df is None or len(df) < 30:
+                return None
+            out = {'code': code, 'name': name, 'data_date': str(df.iloc[-1]['trade_date'])}
+            pattern = detect_launch_pattern(df, params)
+            if pattern:
+                score, details = calc_scores(df, pattern)
+                if score > params['min_score']:
+                    out['candidate'] = {'code': code, 'name': name, 'score': score,
+                                        'last_price': pattern['last_price'],
+                                        'launch_point': pattern['launch_point'],
+                                        'details': details}
+            lu = detect_limit_up(df)
+            if lu:
+                out['limit_up'] = lu
+            sr = detect_steady_rise(df)
+            if sr:
+                out['steady_rise'] = sr
+            return out
+        except Exception as e:
+            print(f"  {code} 处理异常: {e}")
+            return None
 
-        df = fetch_and_save_kline(code)
-        if df is None or len(df) < 30:
-            continue
-        success_count += 1
-        if latest_data_date is None or str(df.iloc[-1]['trade_date']) > latest_data_date:
-            latest_data_date = str(df.iloc[-1]['trade_date'])
+    failed_items = []
 
-        pattern = detect_launch_pattern(df, params)
-        if pattern:
-            score, details = calc_scores(df, pattern)
-            if score > params['min_score']:
-                candidates.append({'code': code, 'name': name, 'score': score})
-                save_candidate(code, name, today, score, pattern['last_price'], pattern['launch_point'], details)
-                print(f"发现候选: {name}({code}) 分数:{score:.1f}")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        for item, res in zip(stock_pool, ex.map(_screen, stock_pool)):
+            done_count[0] += 1
+            if not res:
+                failed_items.append(item)
+                continue
+            success_count += 1
+            if latest_data_date is None or res['data_date'] > latest_data_date:
+                latest_data_date = res['data_date']
+            cand = res.get('candidate')
+            if cand:
+                candidates.append(cand)
+                save_candidate(cand['code'], cand['name'], today, cand['score'],
+                               cand['last_price'], cand['launch_point'], cand['details'])
+                print(f"发现候选: {cand['name']}({cand['code']}) 分数:{cand['score']:.1f}")
+            if res.get('limit_up'):
+                save_signal(res['code'], res['name'], today, '涨停', res['limit_up'])
+                print(f"  涨停: {res['name']}({res['code']}) {res['limit_up']['pct']:.1f}%")
+            if res.get('steady_rise'):
+                save_signal(res['code'], res['name'], today, '放量上涨', res['steady_rise'])
+                print(f"  放量上涨: {res['name']}({res['code']}) 3日{res['steady_rise']['total_pct']:.1f}%")
+            if done_count[0] % 50 == 0:
+                print(f"进度: {done_count[0]}/{len(stock_pool)}，成功抓取 {success_count} 只")
 
-        lu = detect_limit_up(df)
-        if lu:
-            save_signal(code, name, today, '涨停', lu)
-            print(f"  涨停: {name}({code}) {lu['pct']:.1f}%")
+    # 并发过高可能被行情源限流，失败率高的部分串行重试一次
+    if failed_items and success_count < len(stock_pool) * 0.9:
+        print(f"\n{len(failed_items)} 只抓取失败，串行重试一次（防限流）...")
+        for item in failed_items:
+            res = _screen(item)
+            if res:
+                success_count += 1
+                latest_data_date = res['data_date'] if latest_data_date is None else max(latest_data_date, res['data_date'])
+                cand = res.get('candidate')
+                if cand:
+                    candidates.append(cand)
+                    save_candidate(cand['code'], cand['name'], today, cand['score'],
+                                   cand['last_price'], cand['launch_point'], cand['details'])
+                    print(f"发现候选: {cand['name']}({cand['code']}) 分数:{cand['score']:.1f}")
+                if res.get('limit_up'):
+                    save_signal(res['code'], res['name'], today, '涨停', res['limit_up'])
+                if res.get('steady_rise'):
+                    save_signal(res['code'], res['name'], today, '放量上涨', res['steady_rise'])
+            time.sleep(0.2)
 
-        sr = detect_steady_rise(df)
-        if sr:
-            save_signal(code, name, today, '放量上涨', sr)
-            print(f"  放量上涨: {name}({code}) 3日{sr['total_pct']:.1f}%")
-
-        if idx % 20 == 0:
-            print(f"进度: {idx}/{len(stock_pool)}，成功抓取 {success_count} 只")
-
+    print(f"全池抓取与检测耗时 {elapsed()}（{success_count}/{len(stock_pool)} 只成功）")
     candidates.sort(key=lambda x: x['score'], reverse=True)
     for rank, c in enumerate(candidates[:20], 1):
         supabase.table('candidates').update({'rank': rank}).eq('code', c['code']).eq('trade_date', today).execute()
 
     # --- 候选股做T分析 ---
     run_t_analysis_batch(candidates[:20], today, label="候选股")
+    print(f"候选股做T分析耗时 {elapsed()}")
 
-    print(f"\n抓取完成，成功 {success_count}/{len(stock_pool)} 只")
+    print(f"\n抓取完成，成功 {success_count}/{len(stock_pool)} 只，总耗时 {elapsed()}")
     print(f"选股完成，共发现 {len(candidates)} 只候选股票")
     for c in candidates[:5]:
         print(f"  {c['name']}({c['code']}): {c['score']:.1f}分")
 
     # 更新历史追踪
     update_tracking()
+    print(f"追踪更新耗时 {elapsed()}")
 
     # --- 数据时效性检查 + 运行状态上报 ---
     data_date = latest_data_date or '未知'

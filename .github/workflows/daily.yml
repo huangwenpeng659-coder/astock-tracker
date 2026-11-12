@@ -11,18 +11,22 @@ on:
 jobs:
   fetch-and-screen:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: 设置 Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          # 缓存 pip 下载包：requirements.txt 不变时，第二次起安装只需十几秒
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
       - name: 安装依赖
         run: |
-          pip install akshare supabase pandas numpy requests
+          pip install -r requirements.txt --prefer-binary
 
       - name: 运行数据抓取和选股
         env:
@@ -30,6 +34,7 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           STOCK_POOL_MODE: indices
           STOCK_POOL_INDICES: "000300"
+          MAX_WORKERS: "8"
           TZ: Asia/Shanghai
         run: |
           python scripts/fetch_daily.py
