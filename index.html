@@ -352,10 +352,21 @@ function normalizeTData(ts){
   return {signals:outSignals,leaders,minKline,vwap,vwapSeries,advice,confidence};
 }
 
+function mergeTExtra(t){
+  const ex=tExtra[t.code];
+  if(!ex) return t;
+  const merged=Object.assign({},t);
+  ['period','plan','buy_score','sell_score','concepts'].forEach(k=>{
+    if(ex[k]!==undefined&&ex[k]!==null) merged[k]=ex[k];
+  });
+  return merged;
+}
+
 async function loadTStrategy(code){
   const {data,error}=await sb.from('t_strategy').select('*').eq('code',code).order('trade_date',{ascending:false}).limit(1);
   if(error){console.error('读取做T数据失败:',error);return null;}
-  return (data&&data[0])||null;
+  const row=(data&&data[0])||null;
+  return row?mergeTExtra(row):null;
 }
 
 // 取任意一条最新的做T数据（用于当前股票无数据时回退展示）
@@ -606,8 +617,23 @@ async function loadTSignals(){
     const latest=dateRows[0].trade_date;
     const {data}=await sb.from('t_strategy').select('*').eq('trade_date',latest);
     tSignals={};
-    (data||[]).forEach(t=>{tSignals[t.code]=t;});
+    (data||[]).forEach(t=>{tSignals[t.code]=mergeTExtra(t);});
   }catch(e){console.error('加载做T信号失败:',e);}
+}
+
+let tExtra = {};
+
+async function loadTExtra(){
+  try{
+    const {data,error}=await sb.from('config').select('key,value');
+    if(error) return;
+    (data||[]).forEach(r=>{
+      const k=r.key||'';
+      if(!k.startsWith('tstr:')) return;
+      const code=k.split(':')[1];
+      tExtra[code]=safeParse(r.value,{});
+    });
+  }catch(e){console.error('加载做T附加信息失败:',e);}
 }
 
 async function loadConcepts(){
@@ -1025,6 +1051,7 @@ async function init(){
   await loadBacktest();
   await loadConcepts();
   await loadWatchlist();
+  await loadTExtra();
   await loadTSignals();
   await loadTracking();
   await loadSignals();

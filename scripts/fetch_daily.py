@@ -906,6 +906,19 @@ def save_t_strategy(code, name, trade_date, industry, result, concepts=None):
         except Exception as e2:
             print(f"  保存做T分析失败 {code}: {e2}")
             return
+    # 附加字段（周期/计划/强度分/概念）写 config KV，避免依赖 t_strategy 新增列
+    kv_set(f'tstr:{code}', {
+        'trade_date': trade_date,
+        'name': name,
+        'period': result.get('period', '30'),
+        'plan': result.get('plan', {}),
+        'buy_score': result.get('buy_score', 0),
+        'sell_score': result.get('sell_score', 0),
+        'advice': result.get('advice'),
+        'confidence': result.get('confidence'),
+        'vwap': result.get('vwap'),
+        'concepts': concepts or [],
+    })
     print(f"  做T分析: {name}({code}) → {result['advice']}[{result['confidence']}] 买分{result.get('buy_score')} 卖分{result.get('sell_score')}")
 
 # ============ 信号检测 ============
