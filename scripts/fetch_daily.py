@@ -629,10 +629,12 @@ def get_industry_leaders(industry_name):
     _leaders_cache[industry_name] = leaders
     return leaders
 
-def fetch_min_kline(code, period='30'):
-    """拉取分钟K线（保留全部历史，供跨日指标计算），period 取 '5'/'15'/'30'/'60'"""
+def fetch_min_kline(code, period='30', days=5):
+    """拉取最近N个交易日的分钟K线，period 取 '5'/'15'/'30'/'60'"""
     try:
-        df = ak.stock_zh_a_hist_min_em(symbol=code, period=period, adjust='')
+        end_date = now_cn().strftime('%Y-%m-%d %H:%M:%S')
+        start_date = (now_cn() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+        df = ak.stock_zh_a_hist_min_em(symbol=code, start_date=start_date, end_date=end_date, period=period, adjust='')
         if df is None or df.empty:
             return None
         df = df.rename(columns={'时间': 'time', '开盘': 'open', '收盘': 'close', '最高': 'high', '最低': 'low', '成交量': 'volume', '成交额': 'amount'})
@@ -814,43 +816,11 @@ def calc_t_signals(df_min, leaders=None, period='30', code=None):
         else:
             leader_corr = '板块龙头平均%+.1f%%，目标股%+.1f%%，走势基本同步' % (leader_avg, target_pct)
 
-    # 7) 5分钟确认（30分钟出信号时，用最新5分钟K线做方向确认）
-    five_dir = None
-    if period == '30' and code:
-        try:
-            df5 = fetch_min_kline(code, '5')
-            if df5 is not None and len(df5) >= 2:
-                c0 = float(df5.iloc[-2]['close'])
-                c1 = float(df5.iloc[-1]['close'])
-                five_dir = '买入' if c1 > c0 else ('卖出' if c1 < c0 else None)
-        except Exception:
-            five_dir = None
+    # 7) 5分钟确认（移除 - 冗余逻辑）
 
     w = {'强': 2.0, '中': 1.0, '弱': 0.5}
-    # 每个指标只取最高强度计一次分，避免同一指标多根K线重复计分抬高置信度
     def score_of(t):
-        best = {}
-        for sg in signals:
-            if sg['type'] != t:
-                continue
-            ind = sg['indicator']
-            val = w.get(sg['strength'], 0)
-            if val > best.get(ind, 0):
-                best[ind] = val
-        return sum(best.values())
-
-    if five_dir:
-        for sg in signals:
-            if sg['type'] == five_dir and sg['indicator'] in ('VWAP', '量能', 'MACD', 'KDJ', '布林带'):
-                sg['confirmed_5m'] = True
-                if sg['strength'] == '中':
-                    sg['strength'] = '强'
-        if five_dir == '买入' and score_of('买入') > 0:
-            signals.append(_mk_signal(tstr(len(df) - 1), '买入', '5分钟确认', 1, 0, '强',
-                                       '最新5分钟K线收阳，确认做T买入方向', float(row['close'])))
-        elif five_dir == '卖出' and score_of('卖出') > 0:
-            signals.append(_mk_signal(tstr(len(df) - 1), '卖出', '5分钟确认', 1, 0, '强',
-                                       '最新5分钟K线收阴，确认做T卖出方向', float(row['close'])))
+        return sum(w.get(sg['strength'], 0) for sg in signals if sg['type'] == t)
 
     buy_score = score_of('买入')
     sell_score = score_of('卖出')
@@ -1359,8 +1329,8 @@ def main():
     for rank, c in enumerate(candidates[:20], 1):
         supabase.table('candidates').update({'rank': rank}).eq('code', c['code']).eq('trade_date', today).execute()
 
-    # --- 候选股做T分析 ---
-    run_t_analysis_batch(candidates[:20], today, label="候选股")
+    # --- 候选股做T分析（限制前10只加快速度）---
+    run_t_analysis_batch(candidates[:10], today, label="候选股")
     print(f"候选股做T分析耗时 {elapsed()}")
 
     print(f"\n抓取完成，成功 {success_count}/{len(stock_pool)} 只，总耗时 {elapsed()}")
