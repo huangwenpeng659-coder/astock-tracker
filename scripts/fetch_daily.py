@@ -158,6 +158,99 @@ def get_sina_symbol(code):
     else:
         return f"sz{code}"
 
+# ============ 全市场中文名映射 ============
+# 覆盖全部A股（含非沪深300成分股），保证任何来源的代码都能显示中文名
+NAME_MAP = {}
+_NAME_MAP_LOADED = False
+
+def load_name_map():
+    global NAME_MAP, _NAME_MAP_LOADED
+    if _NAME_MAP_LOADED:
+        return NAME_MAP
+    try:
+        df = ak.stock_info_a_code_name()
+        NAME_MAP = {str(r['code']).zfill(6): str(r['name']).strip() for _, r in df.iterrows()}
+        print(f"加载A股中文名映射 {len(NAME_MAP)} 只")
+    except Exception as e:
+        print(f"加载中文名映射失败: {e}")
+    _NAME_MAP_LOADED = True
+    return NAME_MAP
+
+def get_stock_name(code, fallback=None):
+    """取中文名：映射表 > 入参 > 代码本身"""
+    if not _NAME_MAP_LOADED:
+        load_name_map()
+    n = NAME_MAP.get(str(code).zfill(6))
+    if n:
+        return n
+    if fallback and fallback != code:
+        return fallback
+    return str(code)
+
+# ============ 概念板块 ============
+_CONCEPT_BOARDS = None
+_CONCEPT_CODE_SET = set()
+
+def _http_json(url, params, tries=3):
+    """带重试的GET请求（东财接口偶发断连）"""
+    last = None
+    for i in range(tries):
+        try:
+            r = requests.get(url, params=params, timeout=25, headers={'User-Agent': 'Mozilla/5.0'})
+            r.encoding = 'utf-8'
+            return r.json()
+        except Exception as e:
+            last = e
+            time.sleep(1.5 * (i + 1))
+    print(f"  请求失败 {url}: {last}")
+    return None
+
+def _load_concept_boards():
+    """概念板块代码集合（东财 m:90+t:3）"""
+    global _CONCEPT_BOARDS, _CONCEPT_CODE_SET
+    if _CONCEPT_BOARDS is not None:
+        return _CONCEPT_BOARDS
+    boards = {}
+    j = _http_json('https://push2.eastmoney.com/api/qt/clist/get',
+                   {'pn': '1', 'pz': '600', 'po': '1', 'np': '1', 'fltt': '2', 'invt': '2',
+                    'fid': 'f3', 'fs': 'm:90+t:3+f:!50', 'fields': 'f12,f14'})
+    for x in ((j or {}).get('data') or {}).get('diff') or []:
+        boards[x['f12']] = x['f14']
+    _CONCEPT_BOARDS = boards
+    _CONCEPT_CODE_SET = set(boards.keys())
+    print(f"加载概念板块 {len(boards)} 个")
+    return boards
+
+def get_stock_concepts(code):
+    """返回该股所属概念板块名称列表"""
+    boards = _load_concept_boards()
+    if not boards:
+        return []
+    j = _http_json('https://push2.eastmoney.com/api/qt/slist/get',
+                   {'fltt': '2', 'invt': '2', 'fields': 'f12,f14',
+                    'secid': f'{1 if code.startswith("6") else 0}.{code}', 'pn': '1', 'pz': '100',
+                    'po': '1', 'np': '1', 'fid': 'f62', 'spt': '3'})
+    diff = ((j or {}).get('data') or {}).get('diff') or []
+    concepts = []
+    for x in diff:
+        bid = x.get('f12')
+        if bid in _CONCEPT_CODE_SET:
+            nm = boards.get(bid) or x.get('f14')
+            if nm and nm not in concepts:
+                concepts.append(nm)
+    return concepts[:12]
+
+def save_stock_concepts(code, name, concepts):
+    """概念写入 stock_concepts 表（前端按需查询，不改动已有表结构）"""
+    if not concepts:
+        return
+    try:
+        supabase.table('stock_concepts').upsert({
+            'code': code, 'name': name, 'concepts': json.dumps(concepts, ensure_ascii=False)
+        }, on_conflict='code').execute()
+    except Exception as e:
+        print(f"  保存概念失败 {code}: {e}")
+
 def save_stock_basic(code, name):
     try:
         supabase.table('stocks').upsert({
@@ -533,7 +626,8 @@ def get_industry_leaders(industry_name):
     _leaders_cache[industry_name] = leaders
     return leaders
 
-def fetch_min_kline(code, period='5'):
+def fetch_min_kline(code, period='30'):
+    """拉取分钟K线（保留全部历史，供跨日指标计算），period 取 '5'/'15'/'30'/'60'"""
     try:
         df = ak.stock_zh_a_hist_min_em(symbol=code, period=period, adjust='')
         if df is None or df.empty:
@@ -542,10 +636,11 @@ def fetch_min_kline(code, period='5'):
         for c in ['open', 'close', 'high', 'low', 'volume', 'amount']:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
-        # 接口一次返回近一个月数据，直接取最新交易日，避免重复请求
-        last_date = df['time'].iloc[-1][:10]
-        df = df[df['time'].str.startswith(last_date)]
-        return df.reset_index(drop=True) if not df.empty else None
+        df = df.dropna(subset=['close']).reset_index(drop=True)
+        if df.empty:
+            return None
+        df['day'] = df['time'].astype(str).str[:10]
+        return df
     except Exception as e:
         print(f"  获取分钟K线失败 {code}: {e}")
         return None
@@ -560,104 +655,244 @@ def calc_kdj(high, low, close, n=9, m1=3, m2=3):
     j = 3 * k - 2 * d
     return k, d, j
 
-def calc_t_signals(df_min, leaders=None):
-    if df_min is None or len(df_min) < 10:
-        return None
-    df = df_min.copy()
-    signals = []
+# ============ 日内做T：标准化信号规则 ============
+# 每条规则统一输出：指标 / 类型 / 触发值 / 阈值 / 强度(强中弱) / 原因 / 价格
+# 强度权重：强=2 中=1 弱=0.5；同向强度分 >=3 视为共振
+T_RULES = {
+    'VWAP': {'dev_strong': 0.8, 'dev_mid': 0.5, 'desc': '价格偏离分时均价线(VWAP)的幅度'},
+    '量能': {'ratio_strong': 2.0, 'ratio_mid': 1.5, 'ma_5m': 20, 'ma_30m': 10, 'desc': '当前K线成交量 / 前N根均量'},
+    'MACD': {'desc': 'MACD柱状线在零轴上下穿越'},
+    'KDJ': {'j_low_strong': 15, 'j_low_mid': 25, 'j_high_strong': 85, 'j_high_mid': 75, 'desc': 'KDJ的J值超买超卖'},
+    '布林带': {'near_pct': 0.01, 'desc': '价格触及或接近布林带上下轨'},
+    '板块': {'leader_threshold': 1.0, 'lag_ratio': 0.5, 'desc': '板块龙头涨跌幅与目标股的背离'},
+    '5分钟确认': {'desc': '30分钟信号方向与最新5分钟K线方向一致'},
+}
 
-    df['cum_amount'] = df['amount'].cumsum()
-    df['cum_volume'] = df['volume'].cumsum()
+def _mk_signal(time, stype, indicator, value, threshold, strength, reason, price):
+    return {'time': time, 'type': stype, 'indicator': indicator, 'value': value,
+            'threshold': threshold, 'strength': strength, 'reason': reason, 'price': price}
+
+def calc_t_signals(df_min, leaders=None, period='30', code=None):
+    """标准化做T信号引擎。
+    - 指标(MA/量能/MACD/KDJ/布林)在完整历史上计算，保证30分钟级别有足够样本
+    - VWAP 每天独立累计（分时均价线）
+    - 只在最后一个交易日的最近若干根K线上评估买卖信号
+    """
+    if df_min is None or len(df_min) < 8:
+        return None
+    df = df_min.copy().reset_index(drop=True)
+    signals = []
+    r = T_RULES
+
+    # 分时均价线：每天从0开始累计
+    df['cum_amount'] = df.groupby('day')['amount'].cumsum()
+    df['cum_volume'] = df.groupby('day')['volume'].cumsum()
     # akshare 分钟K：成交额单位为元，成交量单位为手（1手=100股）
     df['vwap'] = df['cum_amount'] / (df['cum_volume'] * 100)
     vwap_last = float(df['vwap'].iloc[-1])
 
-    # VWAP信号
-    for i in range(max(1, len(df)-6), len(df)):
-        row = df.iloc[i]
-        dev = (row['close'] - row['vwap']) / row['vwap'] * 100 if row['vwap'] > 0 else 0
-        if dev < -0.5:
-            signals.append({'time': row['time'][-8:], 'type': '买入', 'reason': f'价格低于VWAP {abs(dev):.1f}%', 'indicator': 'VWAP'})
-        elif dev > 0.5:
-            signals.append({'time': row['time'][-8:], 'type': '卖出', 'reason': f'价格高于VWAP {dev:.1f}%', 'indicator': 'VWAP'})
+    last_day = df['day'].iloc[-1]
+    day_idx = [i for i in range(len(df)) if df['day'].iloc[i] == last_day]
+    recent_idx = day_idx[-4:] if len(day_idx) >= 4 else day_idx
+    row = df.iloc[-1]
 
-    # 量能突变
-    df['vol_ma20'] = df['volume'].rolling(20).mean()
-    for i in range(max(20, len(df)-6), len(df)):
-        row = df.iloc[i]
-        if pd.notna(row['vol_ma20']) and row['vol_ma20'] > 0:
-            ratio = row['volume'] / row['vol_ma20']
-            if ratio >= 2:
-                if row['close'] > row['open']:
-                    signals.append({'time': row['time'][-8:], 'type': '买入', 'reason': f'放量上涨(量比{ratio:.1f}倍)', 'indicator': '量能'})
-                else:
-                    signals.append({'time': row['time'][-8:], 'type': '卖出', 'reason': f'放量下跌(量比{ratio:.1f}倍)', 'indicator': '量能'})
+    def tstr(idx):
+        return df.iloc[idx]['time']
 
-    # 分钟MACD
-    dif, dea, hist = calc_macd(df['close'], 12, 26, 9)
-    for i in range(max(1, len(df)-6), len(df)):
-        if i < 1:
+    # 1) VWAP 偏离
+    for i in recent_idx:
+        rw = df.iloc[i]
+        if not rw['vwap'] or rw['vwap'] <= 0:
             continue
-        if pd.notna(hist.iloc[i]) and pd.notna(hist.iloc[i-1]):
-            if hist.iloc[i] > 0 and hist.iloc[i-1] <= 0:
-                signals.append({'time': df.iloc[i]['time'][-8:], 'type': '买入', 'reason': 'MACD金叉', 'indicator': 'MACD'})
-            elif hist.iloc[i] < 0 and hist.iloc[i-1] >= 0:
-                signals.append({'time': df.iloc[i]['time'][-8:], 'type': '卖出', 'reason': 'MACD死叉', 'indicator': 'MACD'})
+        dev = (rw['close'] - rw['vwap']) / rw['vwap'] * 100
+        adev = abs(dev)
+        if adev >= r['VWAP']['dev_strong']:
+            strength, thr = '强', r['VWAP']['dev_strong']
+        elif adev >= r['VWAP']['dev_mid']:
+            strength, thr = '中', r['VWAP']['dev_mid']
+        else:
+            continue
+        stype = '买入' if dev < 0 else '卖出'
+        word = '低于' if dev < 0 else '高于'
+        signals.append(_mk_signal(tstr(i), stype, 'VWAP', round(dev, 2), thr, strength,
+                                   '%sVWAP %.2f%%（阈值%s%%）' % (word, adev, thr), float(rw['close'])))
 
-    # KDJ
+    # 2) 量能突变（均线长度按周期自适应：5分钟20根，30分钟10根）
+    ma_n = r['量能']['ma_5m'] if period == '5' else r['量能']['ma_30m']
+    df['vol_ma'] = df['volume'].rolling(ma_n).mean()
+    for i in recent_idx:
+        rw = df.iloc[i]
+        if not pd.notna(rw['vol_ma']) or rw['vol_ma'] <= 0:
+            continue
+        ratio = rw['volume'] / rw['vol_ma']
+        if ratio >= r['量能']['ratio_strong']:
+            strength, thr = '强', r['量能']['ratio_strong']
+        elif ratio >= r['量能']['ratio_mid']:
+            strength, thr = '中', r['量能']['ratio_mid']
+        else:
+            continue
+        stype = '买入' if rw['close'] > rw['open'] else '卖出'
+        word = '放量上涨' if stype == '买入' else '放量下跌'
+        signals.append(_mk_signal(tstr(i), stype, '量能', round(ratio, 2), thr, strength,
+                                   '%s，量比%.2f倍（阈值%s倍）' % (word, ratio, thr), float(rw['close'])))
+
+    # 3) MACD 零轴穿越
+    dif, dea, hist = calc_macd(df['close'], 12, 26, 9)
+    for i in recent_idx:
+        if i < 1 or not pd.notna(hist.iloc[i]) or not pd.notna(hist.iloc[i - 1]):
+            continue
+        above_zero = hist.iloc[i] > 0
+        cross_up = above_zero and hist.iloc[i - 1] <= 0
+        cross_dn = (not above_zero) and hist.iloc[i - 1] >= 0
+        if not (cross_up or cross_dn):
+            continue
+        stype = '买入' if cross_up else '卖出'
+        strength = '强' if above_zero else '中'
+        word = '零轴上方金叉' if cross_up else '零轴下方死叉'
+        signals.append(_mk_signal(tstr(i), stype, 'MACD', round(float(hist.iloc[i]), 4), 0, strength,
+                                   word, float(df.iloc[i]['close'])))
+
+    # 4) KDJ 超买超卖
     k, d, j = calc_kdj(df['high'], df['low'], df['close'])
-    last_j = float(j.iloc[-1]) if pd.notna(j.iloc[-1]) else 50
-    if last_j < 20:
-        signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '买入', 'reason': f'KDJ超卖(J={last_j:.0f})', 'indicator': 'KDJ'})
-    elif last_j > 80:
-        signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '卖出', 'reason': f'KDJ超买(J={last_j:.0f})', 'indicator': 'KDJ'})
+    jv = float(j.iloc[-1]) if pd.notna(j.iloc[-1]) else 50
+    if jv <= r['KDJ']['j_low_strong']:
+        signals.append(_mk_signal(tstr(len(df) - 1), '买入', 'KDJ', round(jv, 1), r['KDJ']['j_low_strong'], '强',
+                                   'J值%.0f 深度超卖（阈值%d）' % (jv, r['KDJ']['j_low_strong']), float(row['close'])))
+    elif jv <= r['KDJ']['j_low_mid']:
+        signals.append(_mk_signal(tstr(len(df) - 1), '买入', 'KDJ', round(jv, 1), r['KDJ']['j_low_mid'], '中',
+                                   'J值%.0f 超卖（阈值%d）' % (jv, r['KDJ']['j_low_mid']), float(row['close'])))
+    elif jv >= r['KDJ']['j_high_strong']:
+        signals.append(_mk_signal(tstr(len(df) - 1), '卖出', 'KDJ', round(jv, 1), r['KDJ']['j_high_strong'], '强',
+                                   'J值%.0f 深度超买（阈值%d）' % (jv, r['KDJ']['j_high_strong']), float(row['close'])))
+    elif jv >= r['KDJ']['j_high_mid']:
+        signals.append(_mk_signal(tstr(len(df) - 1), '卖出', 'KDJ', round(jv, 1), r['KDJ']['j_high_mid'], '中',
+                                   'J值%.0f 超买（阈值%d）' % (jv, r['KDJ']['j_high_mid']), float(row['close'])))
 
-    # 布林带
+    # 5) 布林带
     boll_mid = df['close'].rolling(20).mean()
     boll_std = df['close'].rolling(20).std()
     boll_upper = boll_mid + 2 * boll_std
     boll_lower = boll_mid - 2 * boll_std
     if len(df) >= 20:
-        last_close = df.iloc[-1]['close']
-        if pd.notna(boll_lower.iloc[-1]) and last_close <= boll_lower.iloc[-1]:
-            signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '买入', 'reason': '触及布林下轨', 'indicator': '布林带'})
-        if pd.notna(boll_upper.iloc[-1]) and last_close >= boll_upper.iloc[-1]:
-            signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '卖出', 'reason': '触及布林上轨', 'indicator': '布林带'})
+        last_close = float(df.iloc[-1]['close'])
+        lo = boll_lower.iloc[-1]
+        up = boll_upper.iloc[-1]
+        if pd.notna(lo):
+            if last_close <= lo:
+                signals.append(_mk_signal(tstr(len(df) - 1), '买入', '布林带', round(last_close, 2), round(float(lo), 2), '强',
+                                           '收盘跌破布林下轨', last_close))
+            elif last_close <= lo * (1 + r['布林带']['near_pct']):
+                signals.append(_mk_signal(tstr(len(df) - 1), '买入', '布林带', round(last_close, 2), round(float(lo), 2), '中',
+                                           '接近布林下轨', last_close))
+        if pd.notna(up):
+            if last_close >= up:
+                signals.append(_mk_signal(tstr(len(df) - 1), '卖出', '布林带', round(last_close, 2), round(float(up), 2), '强',
+                                           '收盘突破布林上轨', last_close))
+            elif last_close >= up * (1 - r['布林带']['near_pct']):
+                signals.append(_mk_signal(tstr(len(df) - 1), '卖出', '布林带', round(last_close, 2), round(float(up), 2), '中',
+                                           '接近布林上轨', last_close))
 
-    # 板块联动
+    # 6) 板块联动
     leader_corr = ''
     if leaders:
-        target_pct = (df.iloc[-1]['close'] - df.iloc[0]['open']) / df.iloc[0]['open'] * 100 if df.iloc[0]['open'] > 0 else 0
+        day_rows = df[df['day'] == last_day]
+        target_pct = (day_rows.iloc[-1]['close'] - day_rows.iloc[0]['open']) / day_rows.iloc[0]['open'] * 100 if day_rows.iloc[0]['open'] > 0 else 0
         leader_avg = sum(l['pct'] for l in leaders) / len(leaders)
-        if leader_avg > 1 and target_pct < leader_avg * 0.5:
-            leader_corr = f'板块龙头平均涨{leader_avg:.1f}%，目标股仅涨{target_pct:.1f}%，存在补涨机会'
-            signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '买入', 'reason': f'板块联动补涨(龙头+{leader_avg:.1f}%)', 'indicator': '板块'})
-        elif leader_avg < -1 and target_pct > leader_avg * 0.5:
-            leader_corr = f'板块龙头平均跌{leader_avg:.1f}%，目标股仅跌{target_pct:.1f}%，注意补跌风险'
-            signals.append({'time': df.iloc[-1]['time'][-8:], 'type': '卖出', 'reason': f'板块联动补跌风险(龙头{leader_avg:.1f}%)', 'indicator': '板块'})
+        thr = r['板块']['leader_threshold']
+        lag = r['板块']['lag_ratio']
+        if leader_avg >= thr and target_pct < leader_avg * lag:
+            leader_corr = '板块龙头平均涨%.1f%%，目标股仅涨%.1f%%，存在补涨机会' % (leader_avg, target_pct)
+            signals.append(_mk_signal(tstr(len(df) - 1), '买入', '板块', round(leader_avg, 2), thr, '强',
+                                       '板块龙头均涨%.1f%%，目标股滞后（补涨）' % leader_avg, float(row['close'])))
+        elif leader_avg <= -thr and target_pct > leader_avg * lag:
+            leader_corr = '板块龙头平均跌%.1f%%，目标股仅跌%.1f%%，注意补跌风险' % (leader_avg, target_pct)
+            signals.append(_mk_signal(tstr(len(df) - 1), '卖出', '板块', round(leader_avg, 2), thr, '强',
+                                       '板块龙头均跌%.1f%%，目标股滞后（补跌风险）' % leader_avg, float(row['close'])))
         else:
-            leader_corr = f'板块龙头平均{leader_avg:+.1f}%，目标股{target_pct:+.1f}%，走势基本同步'
+            leader_corr = '板块龙头平均%+.1f%%，目标股%+.1f%%，走势基本同步' % (leader_avg, target_pct)
 
-    # 综合建议：按共振指标数计，避免同一指标多根K线重复计数抬高置信度
-    buy_count = len({s['indicator'] for s in signals if s['type'] == '买入'})
-    sell_count = len({s['indicator'] for s in signals if s['type'] == '卖出'})
-    if buy_count >= 3:
+    # 7) 5分钟确认（30分钟出信号时，用最新5分钟K线做方向确认）
+    five_dir = None
+    if period == '30' and code:
+        try:
+            df5 = fetch_min_kline(code, '5')
+            if df5 is not None and len(df5) >= 2:
+                c0 = float(df5.iloc[-2]['close'])
+                c1 = float(df5.iloc[-1]['close'])
+                five_dir = '买入' if c1 > c0 else ('卖出' if c1 < c0 else None)
+        except Exception:
+            five_dir = None
+
+    w = {'强': 2.0, '中': 1.0, '弱': 0.5}
+    # 每个指标只取最高强度计一次分，避免同一指标多根K线重复计分抬高置信度
+    def score_of(t):
+        best = {}
+        for sg in signals:
+            if sg['type'] != t:
+                continue
+            ind = sg['indicator']
+            val = w.get(sg['strength'], 0)
+            if val > best.get(ind, 0):
+                best[ind] = val
+        return sum(best.values())
+
+    if five_dir:
+        for sg in signals:
+            if sg['type'] == five_dir and sg['indicator'] in ('VWAP', '量能', 'MACD', 'KDJ', '布林带'):
+                sg['confirmed_5m'] = True
+                if sg['strength'] == '中':
+                    sg['strength'] = '强'
+        if five_dir == '买入' and score_of('买入') > 0:
+            signals.append(_mk_signal(tstr(len(df) - 1), '买入', '5分钟确认', 1, 0, '强',
+                                       '最新5分钟K线收阳，确认做T买入方向', float(row['close'])))
+        elif five_dir == '卖出' and score_of('卖出') > 0:
+            signals.append(_mk_signal(tstr(len(df) - 1), '卖出', '5分钟确认', 1, 0, '强',
+                                       '最新5分钟K线收阴，确认做T卖出方向', float(row['close'])))
+
+    buy_score = score_of('买入')
+    sell_score = score_of('卖出')
+
+    if buy_score >= 3 and buy_score > sell_score:
         advice, confidence = '建议做T买入', '高'
-    elif buy_count >= 2:
+    elif buy_score >= 2 and buy_score > sell_score:
         advice, confidence = '可考虑做T买入', '中'
-    elif sell_count >= 3:
+    elif sell_score >= 3 and sell_score > buy_score:
         advice, confidence = '建议做T卖出', '高'
-    elif sell_count >= 2:
+    elif sell_score >= 2 and sell_score > buy_score:
         advice, confidence = '可考虑做T卖出', '中'
-    elif buy_count > 0 and sell_count > 0:
+    elif buy_score > 0 and sell_score > 0:
         advice, confidence = '信号矛盾，建议观望', '低'
     else:
         advice, confidence = '信号不足，继续观察', '低'
 
-    min_data = [{'t': r['time'][-8:], 'o': round(r['open'], 2), 'c': round(r['close'], 2),
-                 'h': round(r['high'], 2), 'l': round(r['low'], 2), 'v': int(r['volume']),
-                 'vwap': round(r['vwap'], 2) if pd.notna(r['vwap']) else None}
-                for _, r in df.iterrows()]
+    # 标准化交易计划
+    last_close = float(row['close'])
+    atr = float((df['high'] - df['low']).rolling(14).mean().iloc[-1]) if len(df) >= 14 else last_close * 0.01
+    if not pd.notna(atr) or atr <= 0:
+        atr = last_close * 0.01
+    if advice.endswith('买入'):
+        entry = round(min(last_close, vwap_last), 2)
+        stop = round(min(entry - atr * 1.0, vwap_last * 0.99), 2)
+        target = round(vwap_last * 1.005, 2)
+    elif advice.endswith('卖出'):
+        entry = round(max(last_close, vwap_last), 2)
+        stop = round(max(entry + atr * 1.0, vwap_last * 1.01), 2)
+        target = round(vwap_last * 0.995, 2)
+    else:
+        entry = stop = target = round(last_close, 2)
+    position = {'高': '3成', '中': '2成', '低': '1成'}[confidence]
+    plan = {
+        'entry': entry, 'stop': stop, 'target': target,
+        'position': position, 'atr': round(atr, 2),
+        'note': 'VWAP回归为主目标，破VWAP×0.99止损；做T只用底仓，不新增总仓位'
+    }
+
+    # 图表数据：保留最近40根K线（跨日上下文），时间格式统一便于信号定位
+    chart = df.tail(40)
+    min_data = [{'t': r0['time'], 'o': round(r0['open'], 2), 'c': round(r0['close'], 2),
+                 'h': round(r0['high'], 2), 'l': round(r0['low'], 2), 'v': int(r0['volume']),
+                 'vwap': round(r0['vwap'], 2) if pd.notna(r0['vwap']) else None}
+                for _, r0 in chart.iterrows()]
 
     return {
         'vwap': round(vwap_last, 2),
@@ -666,25 +901,45 @@ def calc_t_signals(df_min, leaders=None):
         'leader_correlation': leader_corr,
         'advice': advice,
         'confidence': confidence,
-        'min_kline': min_data
+        'min_kline': min_data,
+        'period': period,
+        'trade_date': last_day,
+        'buy_score': round(buy_score, 1),
+        'sell_score': round(sell_score, 1),
+        'plan': plan,
+        'rules': T_RULES
     }
 
-def save_t_strategy(code, name, trade_date, industry, result):
+def save_t_strategy(code, name, trade_date, industry, result, concepts=None):
+    row = {
+        'code': code, 'name': name, 'trade_date': trade_date,
+        'vwap': result['vwap'],
+        'signals': json.dumps(result['signals'], ensure_ascii=False),
+        'industry': industry or '',
+        'leaders': json.dumps(result['leaders'], ensure_ascii=False),
+        'leader_correlation': result['leader_correlation'],
+        'advice': result['advice'],
+        'confidence': result['confidence'],
+        'min_kline': json.dumps(result['min_kline'], ensure_ascii=False),
+        'period': result.get('period', '30'),
+        'plan': json.dumps(result.get('plan', {}), ensure_ascii=False),
+        'buy_score': result.get('buy_score', 0),
+        'sell_score': result.get('sell_score', 0),
+        'concepts': json.dumps(concepts or [], ensure_ascii=False),
+    }
     try:
-        supabase.table('t_strategy').upsert({
-            'code': code, 'name': name, 'trade_date': trade_date,
-            'vwap': result['vwap'],
-            'signals': json.dumps(result['signals'], ensure_ascii=False),
-            'industry': industry or '',
-            'leaders': json.dumps(result['leaders'], ensure_ascii=False),
-            'leader_correlation': result['leader_correlation'],
-            'advice': result['advice'],
-            'confidence': result['confidence'],
-            'min_kline': json.dumps(result['min_kline'], ensure_ascii=False)
-        }, on_conflict='code,trade_date').execute()
-        print(f"  做T分析: {name}({code}) → {result['advice']}[{result['confidence']}]")
+        supabase.table('t_strategy').upsert(row, on_conflict='code,trade_date').execute()
     except Exception as e:
-        print(f"  保存做T分析失败 {code}: {e}")
+        # 新列可能还没建，降级为旧字段写入
+        legacy = {k: row[k] for k in ['code', 'name', 'trade_date', 'vwap', 'signals', 'industry',
+                                     'leaders', 'leader_correlation', 'advice', 'confidence', 'min_kline']}
+        try:
+            supabase.table('t_strategy').upsert(legacy, on_conflict='code,trade_date').execute()
+            print(f"  {code} 新字段写入失败({e})，已用旧字段保存")
+        except Exception as e2:
+            print(f"  保存做T分析失败 {code}: {e2}")
+            return
+    print(f"  做T分析: {name}({code}) → {result['advice']}[{result['confidence']}] 买分{result.get('buy_score')} 卖分{result.get('sell_score')}")
 
 # ============ 信号检测 ============
 
@@ -814,18 +1069,39 @@ def update_tracking():
         except Exception as e:
             print(f"  {code} 更新追踪失败: {e}")
 
+    # 补齐追踪股票的概念标签（复盘页要用）
+    try:
+        codes = list({t['code'] for t in tracking})
+        names = {t['code']: get_stock_name(t['code'], t.get('name')) for t in tracking}
+
+        def _fetch(c):
+            try:
+                cs = get_stock_concepts(c)
+                if cs:
+                    save_stock_concepts(c, names.get(c, c), cs)
+            except Exception:
+                pass
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(_fetch, codes))
+        print(f"  已补齐 {len(codes)} 只追踪股的概念标签")
+    except Exception as e:
+        print(f"  补齐概念失败: {e}")
+
 
 def run_t_analysis(code, name, trade_date):
     try:
-        min_df = fetch_min_kline(code)
-        if min_df is None or len(min_df) < 10:
-            print(f"  {name}({code}) 分钟K线不足，跳过做T分析")
+        name = get_stock_name(code, name)
+        min_df = fetch_min_kline(code, '30')
+        if min_df is None or len(min_df) < 8:
+            print(f"  {name}({code}) 30分钟K线不足，跳过做T分析")
             return
         industry = get_stock_industry(code)
         leaders = get_industry_leaders(industry) if industry else []
-        t_result = calc_t_signals(min_df, leaders)
+        concepts = get_stock_concepts(code)
+        t_result = calc_t_signals(min_df, leaders, period='30', code=code)
         if t_result:
-            save_t_strategy(code, name, trade_date, industry, t_result)
+            save_t_strategy(code, name, trade_date, industry, t_result, concepts)
+            save_stock_concepts(code, name, concepts)
     except Exception as e:
         print(f"  {name}({code}) 做T分析异常: {e}")
 
@@ -841,7 +1117,9 @@ def run_t_analysis_batch(stocks, trade_date, max_workers=6, label="股票"):
 
 def main():
     params = load_config()
-    today = now_cn().strftime("%Y-%m-%d")
+    now = now_cn()
+    today = now.strftime("%Y-%m-%d")
+    load_name_map()
 
     # --- 自选股分析 ---
     try:
@@ -856,7 +1134,7 @@ def main():
         t_targets = []
         for item in watchlist:
             code = item['code']
-            name = item.get('name', code)
+            name = get_stock_name(code, item.get('name'))
             df = fetch_and_save_kline(code)
             if df is None or len(df) < 20:
                 print(f"  {name}({code}) 数据不足，跳过")
@@ -873,14 +1151,18 @@ def main():
     print(f"\n开始抓取 A股数据（共{len(stock_pool)}只）...")
     candidates = []
     success_count = 0
+    latest_data_date = None
 
-    for idx, (code, name) in enumerate(stock_pool):
+    for idx, (code, pool_name) in enumerate(stock_pool):
+        name = get_stock_name(code, pool_name)
         save_stock_basic(code, name)
 
         df = fetch_and_save_kline(code)
         if df is None or len(df) < 30:
             continue
         success_count += 1
+        if latest_data_date is None or str(df.iloc[-1]['trade_date']) > latest_data_date:
+            latest_data_date = str(df.iloc[-1]['trade_date'])
 
         pattern = detect_launch_pattern(df, params)
         if pattern:
@@ -917,6 +1199,32 @@ def main():
 
     # 更新历史追踪
     update_tracking()
+
+    # --- 数据时效性检查 + 运行状态上报 ---
+    data_date = latest_data_date or '未知'
+    stale = data_date not in ('未知', today)
+    if stale:
+        print(f"\n⚠️ 警告：行情数据最新日期为 {data_date}，不是今天({today})")
+        print("   可能是收盘后行情尚未发布（建议15:30后再跑）或今天不是交易日")
+        print("   本次写入都会被打上今天的日期，但K线内容仍是旧的，请谨慎参考")
+    else:
+        print(f"\n✅ 数据日期 {data_date}，已是最新")
+
+    try:
+        supabase.table('config').upsert({
+            'key': 'last_run',
+            'value': json.dumps({
+                'run_at': now.strftime('%Y-%m-%d %H:%M:%S'),
+                'data_date': data_date,
+                'today': today,
+                'stale': stale,
+                'candidates': len(candidates),
+                'pool': len(stock_pool),
+                'fetched': success_count,
+            }, ensure_ascii=False)
+        }, on_conflict='key').execute()
+    except Exception as e:
+        print(f"写入运行状态失败: {e}")
 
 if __name__ == "__main__":
     main()
