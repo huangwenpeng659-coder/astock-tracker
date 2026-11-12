@@ -93,6 +93,13 @@ let lastRun = null;
 
 function fmt(v,d=2){return Number(v).toFixed(d)}
 
+// jsonb 列在 Supabase 返回时已是对象/数组，直接 JSON.parse 会抛错
+function safeParse(v, fallback){
+  if(v===null||v===undefined) return fallback;
+  if(typeof v==='object') return v;
+  try{ return JSON.parse(v); }catch(e){ return fallback; }
+}
+
 const VIEWS = [
   {id:'radar',name:'机会雷达',icon:'🎯'},
   {id:'watchlist',name:'自选股',icon:'⭐'},
@@ -287,9 +294,12 @@ let tMinChart = null;
 
 // 历史数据的VWAP曾因单位错误（成交额元/成交量手）放大100倍，这里做兼容换算
 function normalizeTData(ts){
-  const signals=JSON.parse(ts.signals||'[]');
-  const leaders=JSON.parse(ts.leaders||'[]');
-  const minKline=JSON.parse(ts.min_kline||'[]');
+  const signals=safeParse(ts.signals,[]);
+  const leaders=safeParse(ts.leaders,[]);
+  const minKline=safeParse(ts.min_kline,[]);
+  if(!Array.isArray(signals)) signals.length=0;
+  if(!Array.isArray(leaders)) leaders.length=0;
+  if(!Array.isArray(minKline)) minKline.length=0;
   if(!minKline.length) return {signals,leaders,minKline,vwap:ts.vwap,vwapSeries:[],advice:ts.advice,confidence:ts.confidence};
 
   const closes=minKline.map(k=>k.c);
@@ -385,8 +395,7 @@ async function renderTStrategy(){
       <div class="sub" style="flex:1">${s.reason}${val}</div></div>`;
   }).join('');
 
-  let tplan=ts.plan;
-  if(typeof tplan==='string'){try{tplan=JSON.parse(tplan);}catch(e){tplan=null;}}
+  let tplan=safeParse(ts.plan,null);
   const planCard=(tplan&&tplan.entry)?`<div class="card" style="border-color:rgba(250,204,21,.35)">
       <div class="card-title"><div class="t"><span class="dot" style="background:var(--gold)"></span>标准化做T计划</div><span class="sub">${ts.period||'30'}分钟周期</span></div>
       <div class="row"><span class="sub">触发价</span><b>${fmt(tplan.entry)}</b></div>
@@ -607,7 +616,7 @@ async function loadConcepts(){
     if(error){console.error('加载概念失败:',error);return;}
     (data||[]).forEach(r=>{
       let v=r.concepts;
-      if(typeof v==='string'){try{v=JSON.parse(v);}catch(e){v=[];}}
+      v=safeParse(v,[]);
       conceptMap[r.code]=Array.isArray(v)?v:[];
     });
   }catch(e){console.error('加载概念失败:',e);}
@@ -626,7 +635,7 @@ async function loadBacktest(){
     if(error){console.error('加载回测结果失败:',error);return;}
     (data||[]).forEach(r=>{
       let v=r.value;
-      if(typeof v==='string'){try{v=JSON.parse(v);}catch(e){v=null;}}
+      v=safeParse(v,null);
       backtestData[r.key]=v;
     });
   }catch(e){console.error('加载回测结果失败:',e);}
@@ -637,7 +646,7 @@ async function loadLastRun(){
     const {data}=await sb.from('config').select('value').eq('key','last_run').limit(1);
     if(data&&data.length){
       let v=data[0].value;
-      if(typeof v==='string'){try{v=JSON.parse(v);}catch(e){v=null;}}
+      v=safeParse(v,null);
       lastRun=v;
     }
   }catch(e){console.error('加载运行状态失败:',e);}
@@ -692,8 +701,8 @@ function renderWatchlist(){
     const s=watchScores[w.code];
     const score=s?s.score:'--';
     const grade=s?s.grade:'待分析';
-    const sigs=s?JSON.parse(s.signals||'[]'):[];
-    const dims=s?JSON.parse(s.dims||'{}'):{};
+    const sigs=s?safeParse(s.signals,[]):[];
+    const dims=s?safeParse(s.dims,{}):{};
     const dimBars=Object.entries(dims).map(([name,d])=>{
       const pct=Math.round(d.raw/d.max*100);
       return `<div style="margin-top:6px">
@@ -769,7 +778,7 @@ function renderTSignals(){
   const norm=Object.values(tSignals).map(t=>{
     const n=normalizeTData(t);
     let plan=t.plan;
-    if(typeof plan==='string'){try{plan=JSON.parse(plan);}catch(e){plan=null;}}
+    plan=safeParse(plan,null);
     return {code:t.code,name:t.name,trade_date:t.trade_date,industry:t.industry,
       advice:n.advice,confidence:n.confidence,vwap:n.vwap,signals:n.signals,
       period:t.period||'30',plan:plan,buy_score:t.buy_score||0,sell_score:t.sell_score||0};
@@ -830,7 +839,7 @@ async function loadConfig(){
   try{
     const {data}=await sb.from('config').select('*').eq('key','thresholds');
     if(data&&data[0]&&data[0].value){
-      const val=typeof data[0].value==='string'?JSON.parse(data[0].value):data[0].value;
+      const val=safeParse(data[0].value,null);
       return val;
     }
     return {};

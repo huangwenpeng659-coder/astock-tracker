@@ -57,8 +57,23 @@ def pct(a, b):
 
 # ============ 1. 做T信号回测 ============
 
+def table_exists(table):
+    try:
+        supabase.table(table).select('*').limit(1).execute()
+        return True
+    except Exception as e:
+        if 'PGRST205' in str(e) or 'does not exist' in str(e):
+            return False
+        return True
+
+
 def backtest_t_signals():
-    rows = fetch_all('t_signal_bars')
+    if not table_exists('t_signal_bars'):
+        return {'samples': 0, 'note': 't_signal_bars 表不存在，请先执行 supabase_schema.sql'}
+    try:
+        rows = fetch_all('t_signal_bars')
+    except Exception as e:
+        return {'samples': 0, 'note': f'读取信号快照失败: {e}'}
     if not rows:
         return {'samples': 0, 'note': '暂无信号快照数据'}
 
@@ -144,13 +159,20 @@ def backtest_t_signals():
 # ============ 2. 选股回测 ============
 
 def backtest_screening():
-    cands = fetch_all('candidates')
+    try:
+        cands = fetch_all('candidates')
+    except Exception as e:
+        return {'samples': 0, 'note': f'读取候选失败: {e}'}
     if not cands:
         return {'samples': 0, 'note': '暂无候选记录'}
 
     codes = sorted({c['code'] for c in cands})
     # daily_kline 批量拉取后本地按入选日切片
-    kl = fetch_all('daily_kline', select='code,trade_date,close,change_pct', code=codes)
+    try:
+        kl = fetch_all('daily_kline', select='code,trade_date,close,change_pct', code=codes)
+    except Exception as e:
+        print(f"  读取日K失败: {e}")
+        kl = []
     kmap = {}
     for k in kl:
         kmap.setdefault(k['code'], []).append((k['trade_date'], float(k['close'])))
@@ -159,7 +181,11 @@ def backtest_screening():
 
     # 概念映射
     concepts = {}
-    for c in fetch_all('stock_concepts', select='code,concepts'):
+    try:
+        concept_rows = fetch_all('stock_concepts', select='code,concepts') if table_exists('stock_concepts') else []
+    except Exception:
+        concept_rows = []
+    for c in concept_rows:
         v = c.get('concepts')
         if isinstance(v, str):
             try:
@@ -281,5 +307,13 @@ def main():
     print(f"回测完成 {now_cn().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
+def safe_main():
+    try:
+        main()
+    except Exception as e:
+        print(f"回测跳过: {e}")
+        print("提示：请在 Supabase SQL Editor 执行 supabase_schema.sql 创建缺失的表")
+
+
 if __name__ == "__main__":
-    main()
+    safe_main()

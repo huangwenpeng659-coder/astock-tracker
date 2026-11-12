@@ -247,6 +247,8 @@ def save_stock_concepts(code, name, concepts):
     """概念写入 stock_concepts 表（前端按需查询，不改动已有表结构）"""
     if not concepts:
         return
+    if not table_exists('stock_concepts'):
+        return
     try:
         supabase.table('stock_concepts').upsert({
             'code': code, 'name': name, 'concepts': json.dumps(concepts, ensure_ascii=False)
@@ -908,7 +910,6 @@ def save_t_strategy(code, name, trade_date, industry, result, concepts=None):
                                      'leaders', 'leader_correlation', 'advice', 'confidence', 'min_kline']}
         try:
             supabase.table('t_strategy').upsert(legacy, on_conflict='code,trade_date').execute()
-            print(f"  {code} 新字段写入失败({e})，已用旧字段保存")
         except Exception as e2:
             print(f"  保存做T分析失败 {code}: {e2}")
             return
@@ -1062,6 +1063,24 @@ def update_tracking():
 
 
 # ============ 分钟数据落库（回测用） ============
+# 表不存在时跳过相关写入，避免每次运行刷几百行错误
+_missing_tables = set()
+
+def table_exists(table):
+    """检查表是否存在（结果缓存，避免重复请求）"""
+    if table in _missing_tables:
+        return False
+    try:
+        supabase.table(table).select('*').limit(1).execute()
+        return True
+    except Exception as e:
+        msg = str(e)
+        if 'PGRST205' in msg or 'does not exist' in msg or 'schema cache' in msg:
+            _missing_tables.add(table)
+            print(f"⚠️ 表 {table} 不存在，跳过相关写入（请在 Supabase 执行 supabase_schema.sql）")
+            return False
+        return True
+
 # 只落 30分钟K，且只对自选股+候选股落库；滚动保留 keep_days 天
 MIN_KEEP_DAYS = int(os.environ.get("MIN_KEEP_DAYS", "90"))
 SIGNAL_WINDOW = 6  # 信号前后各保留几根K
@@ -1090,6 +1109,8 @@ def _bars_with_vwap(df_min):
 
 def save_min_bars(code, df_min, period='30'):
     """分钟K落库（滚动窗口），返回写入行数"""
+    if not table_exists('t_minute'):
+        return 0
     bars = _bars_with_vwap(df_min)
     if not bars:
         return 0
@@ -1108,6 +1129,8 @@ def save_min_bars(code, df_min, period='30'):
     return len(rows)
 
 def prune_min_bars(keep_days=MIN_KEEP_DAYS):
+    if not table_exists('t_minute'):
+        return
     cutoff = (now_cn() - timedelta(days=keep_days)).strftime('%Y-%m-%d')
     try:
         supabase.table('t_minute').delete().lt('trade_date', cutoff).execute()
@@ -1116,6 +1139,8 @@ def prune_min_bars(keep_days=MIN_KEEP_DAYS):
 
 def save_signal_snapshots(code, df_min, signals, period='30'):
     """保存信号前后窗口K线快照；历史信号会在后续交易日被再次刷新（补上未来的K线）"""
+    if not table_exists('t_signal_bars'):
+        return 0
     bars = _bars_with_vwap(df_min)
     if not bars:
         return 0
