@@ -1,0 +1,17 @@
+{
+  "stocks": [
+    {
+      "code": "301357",
+      "name": "北方长龙",
+      "cost": 92,
+      "quantity": 0,
+      "category": "军工",
+      "notes": "脉冲驱动，做T标的",
+      "addedDate": "2026-11-13"
+    }
+  ],
+  "metadata": {
+    "lastUpdated": "2026-11-13",
+    "analysisFramework": "swing-trading-discipline"
+  }
+}
