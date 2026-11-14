@@ -2,7 +2,14 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0a0e17">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="埋伏追踪">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect fill='%230a0e17' width='192' height='192'/><circle cx='96' cy='96' r='70' fill='%233b82f6'/></svg>">
+<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><rect fill='%230a0e17' width='180' height='180'/><circle cx='90' cy='90' r='65' fill='%233b82f6'/></svg>">
 <title>A股埋伏追踪终端</title>
 <script src="https://cdn.staticfile.org/echarts/5.4.3/echarts.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -1042,6 +1049,34 @@ async function render(){
   window.scrollTo(0,0);
 }
 function go(id){ cur=id; render(); }
+
+let deferredPrompt = null;
+
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('/sw.js').then(reg=>{
+    console.log('✓ Service Worker 已注册');
+  }).catch(err=>console.error('Service Worker 注册失败:', err));
+}
+
+window.addEventListener('beforeinstallprompt', (e)=>{
+  e.preventDefault();
+  deferredPrompt = e;
+  document.getElementById('install-btn')&&(document.getElementById('install-btn').style.display='block');
+});
+
+window.addEventListener('appinstalled', ()=>{
+  console.log('✓ PWA 已安装');
+  deferredPrompt = null;
+  document.getElementById('install-btn')&&(document.getElementById('install-btn').style.display='none');
+});
+
+async function installApp(){
+  if(!deferredPrompt) return;
+  deferredPrompt.prompt();
+  const {outcome}=await deferredPrompt.userChoice;
+  console.log(`用户选择: ${outcome}`);
+  deferredPrompt = null;
+}
 
 async function init(){
   document.getElementById('tabs').innerHTML = VIEWS.map(v=>`<div class="tab" data-id="${v.id}" onclick="go('${v.id}')">${v.name}</div>`).join('');

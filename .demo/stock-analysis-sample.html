@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>个股分析示例 - A股埋伏追踪</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+:root {
+  --bg: #0a0e17;
+  --card: #131a29;
+  --card2: #182135;
+  --border: #1e2a42;
+  --text: #e5edff;
+  --sub: #7c8db5;
+  --up: #ef4444;
+  --down: #22c55e;
+  --brand: #3b82f6;
+  --gold: #f5b942;
+  --purple: #8b5cf6;
+}
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  padding: 20px;
+}
+.header {
+  margin-bottom: 20px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.stock-title {
+  font-size: 24px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+.stock-code {
+  color: var(--sub);
+  font-size: 12px;
+}
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+.card-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--brand);
+  box-shadow: 0 0 8px var(--brand);
+}
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  background: rgba(139, 92, 246, 0.15);
+  color: var(--purple);
+  border: 1px solid rgba(139, 92, 246, 0.3);
+}
+.badge.buy {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--up);
+  border: 1px solid rgba(239, 68, 68, 0.3);
+}
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.row:last-child {
+  border-bottom: none;
+}
+.label {
+  color: var(--sub);
+}
+.value {
+  font-weight: 600;
+  font-size: 15px;
+}
+.up {
+  color: var(--up);
+}
+.down {
+  color: var(--down);
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.stat-card {
+  background: var(--card2);
+  border-radius: 10px;
+  padding: 12px;
+  text-align: center;
+}
+.stat-value {
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+.stat-label {
+  font-size: 12px;
+  color: var(--sub);
+}
+.progress-bar {
+  width: 100%;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+  width: 68%;
+}
+.kline-placeholder {
+  width: 100%;
+  height: 240px;
+  background: var(--card2);
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--sub);
+  font-size: 12px;
+}
+.signal-list {
+  max-height: 300px;
+  overflow-y: auto;
+}
+.signal-item {
+  display: flex;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.signal-item:last-child {
+  border-bottom: none;
+}
+.signal-time {
+  color: var(--sub);
+  font-size: 12px;
+  min-width: 60px;
+}
+.signal-type {
+  font-weight: 600;
+  min-width: 50px;
+}
+.signal-reason {
+  color: var(--sub);
+  font-size: 12px;
+  flex: 1;
+}
+.concept-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.concept-badge {
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  background: rgba(56, 189, 248, 0.12);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.25);
+}
+.notice {
+  background: rgba(139, 92, 246, 0.1);
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  border-radius: 10px;
+  padding: 12px;
+  color: var(--purple);
+  font-size: 12px;
+  margin-top: 12px;
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="stock-title">北方长龙 <span class="badge buy">埋伏</span></div>
+  <div class="stock-code">代码：301357 · 现价：96.50 · 入场：92.00 · 止损：85.50</div>
+</div>
+
+<!-- 评分卡片 -->
+<div class="card">
+  <div class="card-title">
+    <span class="dot"></span>
+    <span>选股评分</span>
+  </div>
+  <div class="grid">
+    <div class="stat-card">
+      <div class="stat-value" style="color: var(--up);">72.5</div>
+      <div class="stat-label">质量分</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" style="color: var(--brand);">A+</div>
+      <div class="stat-label">评级</div>
+    </div>
+  </div>
+  <div class="progress-bar">
+    <div class="progress-fill"></div>
+  </div>
+  <div style="margin-top: 8px; font-size: 12px; color: var(--sub);">
+    📊 放量上涨 · 🎯 K线企稳 · 📈 成交额增加 · 💡 成长潜力
+  </div>
+</div>
+
+<!-- 做T分析 -->
+<div class="card" style="border-color: rgba(139, 92, 246, 0.4);">
+  <div class="card-title" style="justify-content: space-between;">
+    <div>
+      <span class="dot" style="background: var(--purple); box-shadow: 0 0 8px var(--purple);"></span>
+      <span>做T综合建议</span>
+    </div>
+    <span class="badge">置信度: 中</span>
+  </div>
+  <div style="text-align: center; padding: 12px 0;">
+    <div style="font-size: 24px; font-weight: 700; color: var(--up);">建议做T买入</div>
+    <div style="color: var(--sub); margin-top: 4px; font-size: 12px;">
+      VWAP均价 95.32 · 周期 30分钟 · 买分 4.0 / 卖分 1.5
+    </div>
+    <div class="concept-badges">
+      <span class="concept-badge">军工</span>
+      <span class="concept-badge">芯片</span>
+      <span class="concept-badge">高端装备</span>
+    </div>
+  </div>
+</div>
+
+<!-- 交易计划 -->
+<div class="card" style="border-color: rgba(250, 204, 21, 0.35);">
+  <div class="card-title" style="justify-content: space-between;">
+    <div>
+      <span class="dot" style="background: var(--gold);"></span>
+      <span>标准化做T计划</span>
+    </div>
+    <span style="color: var(--sub); font-size: 12px;">30分钟周期</span>
+  </div>
+  <div class="row">
+    <span class="label">触发价</span>
+    <span class="value">96.00</span>
+  </div>
+  <div class="row">
+    <span class="label">止损价</span>
+    <span class="value down">93.50</span>
+  </div>
+  <div class="row">
+    <span class="label">目标价(VWAP回归)</span>
+    <span class="value up">95.32</span>
+  </div>
+  <div class="row">
+    <span class="label">建议仓位</span>
+    <span class="value">2成</span>
+  </div>
+  <div class="row">
+    <span class="label">ATR(14)</span>
+    <span class="value">2.45</span>
+  </div>
+  <div style="margin-top: 8px; padding: 8px; background: var(--card2); border-radius: 8px; font-size: 12px; color: var(--sub);">
+    VWAP回归为主目标，破VWAP×0.99止损；做T只用底仓，不新增总仓位
+  </div>
+</div>
+
+<!-- K线图 -->
+<div class="card">
+  <div class="card-title" style="justify-content: space-between;">
+    <div>
+      <span class="dot"></span>
+      <span>30分钟K线 + VWAP</span>
+    </div>
+    <span style="color: var(--sub); font-size: 12px;">黄线=分时均价VWAP，箭头=买卖信号</span>
+  </div>
+  <div class="kline-placeholder">
+    📈 K线图形（实际应用中由 ECharts 渲染）
+  </div>
+</div>
+
+<!-- 板块联动 -->
+<div class="card">
+  <div class="card-title">
+    <span class="dot"></span>
+    <span>板块联动 · 军工芯片</span>
+  </div>
+  <div class="row">
+    <div class="stock-code" style="flex: 1;">中航光电 (002179)</div>
+    <span class="up" style="font-weight: 600;">+2.45%</span>
+  </div>
+  <div class="row">
+    <div class="stock-code" style="flex: 1;">三达膜 (688101)</div>
+    <span class="up" style="font-weight: 600;">+1.80%</span>
+  </div>
+  <div class="row">
+    <div class="stock-code" style="flex: 1;">华为云 (预期)</div>
+    <span class="down" style="font-weight: 600;">-0.35%</span>
+  </div>
+  <div style="margin-top: 8px; padding: 8px; background: var(--card2); border-radius: 8px; font-size: 12px; color: var(--sub);">
+    板块龙头先涨0.8%，北方长龙滞后入场，补涨概率高
+  </div>
+</div>
+
+<!-- 做T信号明细 -->
+<div class="card">
+  <div class="card-title" style="justify-content: space-between;">
+    <div>
+      <span class="dot"></span>
+      <span>做T信号明细</span>
+    </div>
+    <span style="color: var(--sub); font-size: 12px;">买3 卖2</span>
+  </div>
+  <div class="signal-list">
+    <div class="signal-item">
+      <span class="signal-time">10:30</span>
+      <span class="signal-type up">买入</span>
+      <span class="signal-reason">VWAP 低于均价0.8%，KDJ进入超卖区 [强]</span>
+    </div>
+    <div class="signal-item">
+      <span class="signal-time">11:00</span>
+      <span class="signal-type up">买入</span>
+      <span class="signal-reason">成交量突增，底部放量，KDJ转折向上 [中]</span>
+    </div>
+    <div class="signal-item">
+      <span class="signal-time">11:45</span>
+      <span class="signal-type down">卖出</span>
+      <span class="signal-reason">冲高遇阻，MACD死叉，成交量衰减 [弱]</span>
+    </div>
+    <div class="signal-item">
+      <span class="signal-time">13:00</span>
+      <span class="signal-type up">买入</span>
+      <span class="signal-reason">二次探底，支撑位企稳，反弹确认 [中]</span>
+    </div>
+    <div class="signal-item">
+      <span class="signal-time">14:30</span>
+      <span class="signal-type down">卖出</span>
+      <span class="signal-reason">高点超过VWAP 0.6%，获利了结 [中]</span>
+    </div>
+  </div>
+</div>
+
+<!-- 日志记录（可选） -->
+<div class="card">
+  <div class="card-title">
+    <span class="dot"></span>
+    <span>今日做T日志</span>
+  </div>
+  <table style="width: 100%; font-size: 12px; color: var(--sub);">
+    <thead style="color: var(--text); border-bottom: 1px solid var(--border);">
+      <tr>
+        <th style="text-align: left; padding: 4px 0;">时间</th>
+        <th style="text-align: left; padding: 4px 0;">方向</th>
+        <th style="text-align: right; padding: 4px 0;">价格</th>
+        <th style="text-align: right; padding: 4px 0;">数量</th>
+        <th style="text-align: right; padding: 4px 0;">盈亏</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr style="border-bottom: 1px solid var(--border);">
+        <td style="padding: 6px 0;">10:32</td>
+        <td>反T 卖</td>
+        <td style="text-align: right;">96.20</td>
+        <td style="text-align: right;">10</td>
+        <td style="text-align: right; color: var(--up);">+0</td>
+      </tr>
+      <tr style="border-bottom: 1px solid var(--border);">
+        <td style="padding: 6px 0;">10:55</td>
+        <td>反T 买</td>
+        <td style="text-align: right;">95.80</td>
+        <td style="text-align: right;">10</td>
+        <td style="text-align: right; color: var(--up);">+40 (0.04%)</td>
+      </tr>
+    </tbody>
+  </table>
+  <div style="margin-top: 12px; padding: 8px; background: var(--card2); border-radius: 8px; font-size: 12px; color: var(--sub);">
+    已执行: 1轮反T成功 · 今日T仓盈亏: +40元（0.04%） · 底仓未动
+  </div>
+</div>
+
+<!-- 风险提示 -->
+<div class="notice">
+  ⚠️ 日内做T仅供参考，注意仓位管理和交易成本 · 分析数据基于历史行情，不保证未来表现
+</div>
+
+</body>
+</html>
