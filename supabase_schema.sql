@@ -180,51 +180,30 @@ alter table t_strategy add column if not exists buy_score numeric;
 alter table t_strategy add column if not exists sell_score numeric;
 alter table t_strategy add column if not exists concepts jsonb;
 
-alter table t_minute enable row level security;
-alter table t_signal_bars enable row level security;
-alter table backtest_result enable row level security;
-drop policy if exists "allow all" on t_minute for all to anon using (true) with check (true);
-drop policy if exists "allow all" on t_signal_bars for all to anon using (true) with check (true);
-drop policy if exists "allow all" on backtest_result for all to anon using (true) with check (true);
-create policy "allow all" on t_minute for all to anon using (true) with check (true);
-create policy "allow all" on t_signal_bars for all to anon using (true) with check (true);
-create policy "allow all" on backtest_result for all to anon using (true) with check (true);
-
 -- ============================================================
 -- RLS + anon 读写策略（前端用 publishable key 直接读写）
+-- 用 DO 块逐表处理：表不存在就跳过，可重复执行
 -- ============================================================
-alter table stocks enable row level security;
-alter table daily_kline enable row level security;
-alter table candidates enable row level security;
-alter table candidate_tracking enable row level security;
-alter table daily_signals enable row level security;
-alter table watchlist enable row level security;
-alter table stock_scores enable row level security;
-alter table config enable row level security;
-alter table t_strategy enable row level security;
-alter table stock_concepts enable row level security;
-alter table tracking enable row level security;
+do $$
+declare
+  t text;
+begin
+  foreach t in array array[
+    'stocks','daily_kline','candidates','candidate_tracking','daily_signals',
+    'watchlist','stock_scores','config','t_strategy','stock_concepts','tracking',
+    't_minute','t_signal_bars','backtest_result'
+  ]
+  loop
+    if exists (
+      select 1 from information_schema.tables
+      where table_schema = 'public' and table_name = t
+    ) then
+      execute format('alter table public.%I enable row level security', t);
+      execute format('drop policy if exists "allow all" on public.%I', t);
+      execute format(
+        'create policy "allow all" on public.%I for all to anon using (true) with check (true)', t
+      );
+    end if;
+  end loop;
+end $$;
 
-drop policy if exists "allow all" on stocks for all to anon using (true) with check (true);
-drop policy if exists "allow all" on daily_kline for all to anon using (true) with check (true);
-drop policy if exists "allow all" on candidates for all to anon using (true) with check (true);
-drop policy if exists "allow all" on candidate_tracking for all to anon using (true) with check (true);
-drop policy if exists "allow all" on daily_signals for all to anon using (true) with check (true);
-drop policy if exists "allow all" on watchlist for all to anon using (true) with check (true);
-drop policy if exists "allow all" on stock_scores for all to anon using (true) with check (true);
-drop policy if exists "allow all" on config for all to anon using (true) with check (true);
-drop policy if exists "allow all" on t_strategy for all to anon using (true) with check (true);
-drop policy if exists "allow all" on stock_concepts for all to anon using (true) with check (true);
-drop policy if exists "allow all" on tracking for all to anon using (true) with check (true);
-
-create policy "allow all" on stocks for all to anon using (true) with check (true);
-create policy "allow all" on daily_kline for all to anon using (true) with check (true);
-create policy "allow all" on candidates for all to anon using (true) with check (true);
-create policy "allow all" on candidate_tracking for all to anon using (true) with check (true);
-create policy "allow all" on daily_signals for all to anon using (true) with check (true);
-create policy "allow all" on watchlist for all to anon using (true) with check (true);
-create policy "allow all" on stock_scores for all to anon using (true) with check (true);
-create policy "allow all" on config for all to anon using (true) with check (true);
-create policy "allow all" on t_strategy for all to anon using (true) with check (true);
-create policy "allow all" on stock_concepts for all to anon using (true) with check (true);
-create policy "allow all" on tracking for all to anon using (true) with check (true);

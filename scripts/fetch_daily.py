@@ -1204,6 +1204,39 @@ def save_dip_opportunities(items, trade_date):
     payload = {'trade_date': trade_date, 'count': len(items), 'items': items}
     kv_set('dip:latest', payload)
 
+    # 同时写 daily_signals：该表对 anon 可读，前端不依赖 config 也能看到
+    try:
+        best = {}
+        for it in items:
+            best.setdefault(it['code'], it)
+        rows = []
+        for code, it in best.items():
+            rows.append({
+                'code': code,
+                'name': it.get('name'),
+                'trade_date': trade_date,
+                'signal_type': '低吸机会',
+                'price': it['entry'],
+                'details': {
+                    'pattern': it['pattern'],
+                    'pattern_name': it['pattern_name'],
+                    'level': it['level'],
+                    'entry': it['entry'],
+                    'stop': it['stop'],
+                    'target': it['target'],
+                    'rr': it['rr'],
+                    'score': it['score'],
+                    'reasons': it['reasons'],
+                    'note': it['note'],
+                    'concepts': it.get('concepts', []),
+                },
+            })
+        if rows:
+            supabase.table('daily_signals').upsert(
+                rows, on_conflict='code,trade_date,signal_type').execute()
+    except Exception as e:
+        print(f"低吸结果写入 daily_signals 失败: {e}")
+
 
 # ============ 追踪更新 ============
 

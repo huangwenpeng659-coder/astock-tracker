@@ -661,14 +661,25 @@ async function loadTExtra(){
 async function loadConcepts(){
   try{
     const {data,error}=await sb.from('config').select('key,value').like('key','concepts:%');
-    if(error){console.error('加载概念失败:',error);return;}
-    (data||[]).forEach(r=>{
+    if(error){console.error('加载概念失败:',error);}
+    else (data||[]).forEach(r=>{
       const code=(r.key||'').split(':')[1];
       const payload=safeParse(r.value,{});
       const v=payload&&payload.concepts?payload.concepts:[];
       if(code) conceptMap[code]=Array.isArray(v)?v:[];
     });
   }catch(e){console.error('加载概念失败:',e);}
+
+  // config 被 RLS 锁住时，用 t_strategy.concepts 兜底（该表对 anon 可读）
+  if(Object.keys(conceptMap).length) return;
+  try{
+    const {data}=await sb.from('t_strategy').select('code,concepts');
+    (data||[]).forEach(r=>{
+      if(!r.code||conceptMap[r.code]) return;
+      const c=safeParse(r.concepts,[]);
+      if(Array.isArray(c)&&c.length) conceptMap[r.code]=c;
+    });
+  }catch(e){console.error('加载概念(t_strategy)失败:',e);}
 }
 
 function getConcepts(code){
@@ -680,10 +691,25 @@ let dipData = null;
 
 async function loadDip(){
   try{
+    const {data:dateRows}=await sb.from('daily_signals')
+      .select('trade_date').eq('signal_type','低吸机会')
+      .order('trade_date',{ascending:false}).limit(1);
+    if(dateRows&&dateRows.length){
+      const d=dateRows[0].trade_date;
+      const {data}=await sb.from('daily_signals').select('*')
+        .eq('signal_type','低吸机会').eq('trade_date',d);
+      const items=(data||[]).map(r=>{
+        const x=safeParse(r.details,{})||{};
+        return Object.assign({}, x, {code:r.code,name:r.name,concepts:x.concepts||[]});
+      }).sort((a,b)=>(b.score||0)-(a.score||0));
+      if(items.length){ dipData={trade_date:d,count:items.length,items}; return; }
+    }
+  }catch(e){console.error('加载低吸机会(信号表)失败:',e);}
+  try{
     const {data,error}=await sb.from('config').select('value').eq('key','dip:latest').limit(1);
-    if(error){console.error('加载低吸机会失败:',error);return;}
+    if(error) return;
     if(data&&data.length) dipData=safeParse(data[0].value,null);
-  }catch(e){console.error('加载低吸机会失败:',e);}
+  }catch(e){console.error('加载低吸机会(config)失败:',e);}
 }
 
 const DIP_ICON={
