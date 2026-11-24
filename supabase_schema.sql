@@ -199,11 +199,16 @@ begin
       where table_schema = 'public' and table_name = t
     ) then
       execute format('alter table public.%I enable row level security', t);
-      execute format('drop policy if exists "allow all" on public.%I', t);
-      execute format(
-        'create policy "allow all" on public.%I for all to anon using (true) with check (true)', t
-      );
+      execute format('drop policy if exists "anon read" on public.%I', t);
+      execute format('create policy "anon read" on public.%I for select to anon using (true)', t);
     end if;
   end loop;
 end $$;
+
+-- 前端需要写的两张表：自选股增删、选股参数保存
+drop policy if exists "anon write" on public.watchlist;
+create policy "anon write" on public.watchlist for all to anon using (true) with check (true);
+
+drop policy if exists "anon write" on public.config;
+create policy "anon write" on public.config for all to anon using (true) with check (true);
 
