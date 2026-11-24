@@ -1615,17 +1615,15 @@ def main():
     print(f"全池抓取与检测耗时 {elapsed()}（{success_count}/{len(stock_pool)} 只成功）")
 
     # --- 龙头低吸形态汇总 ---
-    if dip_hits:
-        dip_hits.sort(key=lambda x: (x['score'], x['rr']), reverse=True)
-        top_dip = dip_hits[:DIP_MAX_ITEMS]
-        for it in top_dip:
-            c = kv_get(f'concepts:{it["code"]}')
-            if c and c.get('concepts'):
-                it['concepts'] = c['concepts'][:4]
-        save_dip_opportunities(top_dip, today)
-        names = {v['name'] for v in DIP_PATTERNS.values()}
-        print(f"低吸形态命中 {len(dip_hits)} 只，保存前 {len(top_dip)} 只 " +
-              '／'.join(f"{n}:{sum(1 for x in top_dip if x['pattern_name'] == n)}" for n in names))
+    dip_hits.sort(key=lambda x: (x['score'], x['rr']), reverse=True)
+    top_dip = dip_hits[:DIP_MAX_ITEMS]
+    for it in top_dip:
+        c = kv_get(f'concepts:{it["code"]}')
+        if c and c.get('concepts'):
+            it['concepts'] = c['concepts'][:4]
+    save_dip_opportunities(top_dip, today)
+    if top_dip:
+        print(f"低吸形态命中 {len(dip_hits)} 只，保存前 {len(top_dip)} 只")
     else:
         print("未发现低吸形态")
 
