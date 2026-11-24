@@ -7,9 +7,9 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="埋伏追踪">
-<link rel="manifest" href="/manifest.json">
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect fill='%230a0e17' width='192' height='192'/><circle cx='96' cy='96' r='70' fill='%233b82f6'/></svg>">
-<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><rect fill='%230a0e17' width='180' height='180'/><circle cx='90' cy='90' r='65' fill='%233b82f6'/></svg>">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
 <title>A股埋伏追踪终端</title>
 <script src="https://cdn.staticfile.org/echarts/5.4.3/echarts.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -71,6 +71,16 @@ main{padding:12px}
 .tabbar .ic{font-size:19px;display:block;margin-bottom:2px}
 .notice{font-size:11px;color:var(--sub);text-align:center;padding:14px;line-height:1.6}
 .loading{text-align:center;padding:40px;color:var(--sub)}
+.hdr-right{display:flex;flex-direction:column;align-items:flex-end;gap:5px}
+.install-btn{display:none;background:linear-gradient(135deg,#2563eb,#8b5cf6);color:#fff;border:none;
+  border-radius:14px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;
+  box-shadow:0 2px 10px rgba(59,130,246,.35);white-space:nowrap}
+.install-btn:active{transform:scale(.95)}
+.mask{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:100;display:flex;
+  align-items:center;justify-content:center;padding:24px}
+.guide{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:22px;
+  max-width:340px;width:100%;line-height:1.9;font-size:14px}
+.guide h3{font-size:16px;margin-bottom:12px}
 </style>
 </head>
 <body>
@@ -79,7 +89,10 @@ main{padding:12px}
     <div class="logo">📊 A股<span>埋伏追踪</span></div>
     <div class="sub">价格低位 · 企稳吸筹 · 启动确认</div>
   </div>
-  <div class="sub" id="clock"></div>
+  <div class="hdr-right">
+    <button id="install-btn" class="install-btn" onclick="installApp()">📲 安装到桌面</button>
+    <div class="sub" id="clock"></div>
+  </div>
 </header>
 <nav class="tabs" id="tabs"></nav>
 <main id="view"></main>
@@ -1052,8 +1065,18 @@ function go(id){ cur=id; render(); }
 
 let deferredPrompt = null;
 
+function isStandalone(){
+  return window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}
+
+function syncInstallBtn(){
+  const b = document.getElementById('install-btn');
+  if(b) b.style.display = isStandalone() ? 'none' : 'inline-block';
+}
+
 if('serviceWorker' in navigator){
-  navigator.serviceWorker.register('/sw.js').then(reg=>{
+  navigator.serviceWorker.register('sw.js', {scope:'./'}).then(reg=>{
+    reg.update();
     console.log('✓ Service Worker 已注册');
   }).catch(err=>console.error('Service Worker 注册失败:', err));
 }
@@ -1061,24 +1084,51 @@ if('serviceWorker' in navigator){
 window.addEventListener('beforeinstallprompt', (e)=>{
   e.preventDefault();
   deferredPrompt = e;
-  document.getElementById('install-btn')&&(document.getElementById('install-btn').style.display='block');
+  syncInstallBtn();
 });
 
 window.addEventListener('appinstalled', ()=>{
-  console.log('✓ PWA 已安装');
   deferredPrompt = null;
-  document.getElementById('install-btn')&&(document.getElementById('install-btn').style.display='none');
+  syncInstallBtn();
 });
 
 async function installApp(){
-  if(!deferredPrompt) return;
-  deferredPrompt.prompt();
-  const {outcome}=await deferredPrompt.userChoice;
-  console.log(`用户选择: ${outcome}`);
-  deferredPrompt = null;
+  if(deferredPrompt){
+    deferredPrompt.prompt();
+    const {outcome} = await deferredPrompt.userChoice;
+    console.log('安装结果:', outcome);
+    deferredPrompt = null;
+    syncInstallBtn();
+    return;
+  }
+  showInstallGuide();
+}
+
+function showInstallGuide(){
+  const ua = navigator.userAgent;
+  let steps;
+  if(/iPhone|iPad|iPod/i.test(ua)){
+    steps = '① 用 <b>Safari</b> 打开本页<br>② 点底部的「分享」按钮 🔗<br>③ 选择「<b>添加到主屏幕</b>」<br>④ 点右上角「添加」';
+  }else if(/Android/i.test(ua)){
+    steps = '① 点浏览器右上角「⋮」菜单<br>② 选择「<b>安装应用</b>」或「添加到主屏幕」<br>③ 确认安装';
+  }else{
+    steps = '① 用 <b>Chrome 或 Edge</b> 打开本页<br>② 点地址栏右侧的「安装」图标 ⊕<br>③ 或打开浏览器菜单 →「安装 A股埋伏追踪」<br><br><span style="color:#7c8db5;font-size:12px">Firefox 不支持安装 PWA</span>';
+  }
+  const mask = document.createElement('div');
+  mask.className = 'mask';
+  mask.innerHTML = `<div class="guide">
+    <h3>📲 添加到桌面</h3>
+    <div>${steps}</div>
+    <div style="margin-top:16px;text-align:right">
+      <button onclick="this.closest('.mask').remove()" style="background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:8px 18px;font-size:14px;cursor:pointer">知道了</button>
+    </div>
+  </div>`;
+  mask.onclick = e => { if(e.target === mask) mask.remove(); };
+  document.body.appendChild(mask);
 }
 
 async function init(){
+  syncInstallBtn();
   document.getElementById('tabs').innerHTML = VIEWS.map(v=>`<div class="tab" data-id="${v.id}" onclick="go('${v.id}')">${v.name}</div>`).join('');
   document.getElementById('tabbar').innerHTML = VIEWS.map(v=>`<div data-id="${v.id}" onclick="go('${v.id}')"><span class="ic">${v.icon}</span>${v.name}</div>`).join('');
   function tick(){document.getElementById('clock').textContent=new Date().toLocaleString('zh-CN',{hour12:false}).slice(5,16);}
