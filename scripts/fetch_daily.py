@@ -962,6 +962,249 @@ def save_signal(code, name, trade_date, signal_type, details):
     except Exception as e:
         print(f"保存信号失败 {code} {signal_type}: {e}")
 
+# ============ 龙头低吸形态识别 ============
+# 依据《龙头低吸方法》：只低吸有辨识度的题材龙头/中军，不吸杂毛；
+# 低吸赚的是盈亏比，没有盈亏比就不做。
+
+DIP_PATTERNS = {
+    'golden_pit':  {'name': '黄金坑低吸',   'base': 70},
+    'break_pull':  {'name': '突破回踩低吸', 'base': 72},
+    'fake_yin':    {'name': '换手假阴低吸', 'base': 68},
+    'first_yin':   {'name': '龙头首阴套利', 'base': 60},
+    'second_wave': {'name': '二波低吸',     'base': 74},
+}
+
+DIP_MIN_AMOUNT = 5000 * 10000   # 成交额 5000 万以下流动性差，不做
+DIP_MAX_ITEMS = 40
+
+
+def _limit_pct(code):
+    """涨跌停幅度：创业板/科创板 20cm，其余 10cm"""
+    return 19.0 if str(code).startswith(('300', '301', '688', '689')) else 9.5
+
+
+def _num(x, default=0.0):
+    try:
+        v = float(x)
+        return default if pd.isna(v) else v
+    except (TypeError, ValueError):
+        return default
+
+
+def _dip_hit(key, entry, stop, target, reasons, note='', level='可低吸'):
+    meta = DIP_PATTERNS[key]
+    entry, stop, target = float(entry), float(stop), float(target)
+    if entry <= stop:
+        return None
+    rr = (target - entry) / (entry - stop)
+    score = meta['base'] + (8 if rr >= 2 else 0 if rr >= 1.2 else -10)
+    return {
+        'pattern': key,
+        'pattern_name': meta['name'],
+        'level': level,
+        'entry': round(entry, 2),
+        'stop': round(stop, 2),
+        'target': round(target, 2),
+        'rr': round(rr, 2),
+        'score': round(max(0, min(100, score)), 1),
+        'reasons': reasons,
+        'note': note,
+    }
+
+
+def detect_dip_patterns(df, code):
+    """识别 5 种龙头低吸形态，返回命中的形态列表（可能同时命中多个）"""
+    if df is None or len(df) < 45:
+        return []
+
+    d = df.reset_index(drop=True).copy()
+    for col in ('open', 'high', 'low', 'close', 'volume', 'change_pct'):
+        if col not in d.columns:
+            return []
+        d[col] = pd.to_numeric(d[col], errors='coerce')
+    d = d.dropna(subset=['close', 'high', 'low', 'open', 'change_pct']).reset_index(drop=True)
+    if len(d) < 45:
+        return []
+
+    d['ma5'] = d['close'].rolling(5).mean()
+    d['ma10'] = d['close'].rolling(10).mean()
+    d['ma20'] = d['close'].rolling(20).mean()
+    d['vol_ma5'] = d['volume'].rolling(5).mean()
+    d['vol_ma20'] = d['volume'].rolling(20).mean()
+
+    last = d.iloc[-1]
+    prev = d.iloc[-2]
+    close_t = float(last['close'])
+    open_t = float(last['open'])
+    high_t = float(last['high'])
+    low_t = float(last['low'])
+    vol_t = float(last['volume'])
+    limit = _limit_pct(code)
+
+    if close_t <= 0:
+        return []
+
+    amount = _num(last.get('amount'))
+    if amount and amount < DIP_MIN_AMOUNT:
+        return []
+
+    hits = []
+
+    # 出货预警（文档第四章）：高位放量长上影扣分
+    body = abs(close_t - open_t)
+    upper_shadow = high_t - max(open_t, close_t)
+    warn_long_shadow = upper_shadow > max(body * 2, close_t * 0.02) and vol_t > _num(d['vol_ma20'].iloc[-1]) * 2
+
+    # ---- 形态1：黄金坑（拉升后主动砸坑，坑底圆弧企稳）----
+    seg = d.tail(30).reset_index(drop=True)
+    n = len(seg)
+    if n >= 20:
+        peak_pos = int(seg['high'].iloc[:n - 3].values.argmax())
+        peak = float(seg['high'].iloc[peak_pos])
+        after = seg.iloc[peak_pos + 1:]
+        before = seg.iloc[max(0, peak_pos - 8):peak_pos + 1]
+        if len(after) >= 3 and peak > 0:
+            trough = float(after['low'].min())
+            drawdown = (peak - trough) / peak
+            pulled = before[
+                (before['change_pct'] >= 7) &
+                (before['volume'] >= before['vol_ma20'].fillna(0) * 1.5)
+            ]
+            trough_pos = n - len(after) + int(after['low'].values.argmin())
+            made_low_recently = trough_pos >= n - 4
+            rising = close_t > float(seg['close'].iloc[-4]) and low_t >= trough * 0.99
+            shrink = len(before) > 0 and after['volume'].mean() < before['volume'].mean() * 0.75
+            if len(pulled) and 0.05 <= drawdown <= 0.22 and made_low_recently and rising and shrink:
+                hit = _dip_hit(
+                    'golden_pit', close_t, trough * 0.985, peak,
+                    [f'前期放量拉升，高点 {peak:.2f}',
+                     f'回落 {drawdown * 100:.1f}% 至坑底 {trough:.2f}',
+                     '坑内缩量，近3日重心抬高形成圆弧底'],
+                    '坑底企稳当日低吸，跌破坑底止损',
+                )
+                if hit:
+                    hits.append(hit)
+
+    # ---- 形态2：突破回踩（平台突破后回踩支撑）----
+    if len(d) >= 38:
+        plat = d.iloc[-30:-8]
+        plat_res = float(plat['high'].max())
+        plat_low = float(plat['low'].min())
+        amp = (plat_res - plat_low) / plat_low if plat_low > 0 else 9
+        bo_idx = None
+        for i in range(len(d) - 8, len(d) - 1):
+            ma20_v = d['vol_ma20'].iloc[i]
+            if (d['close'].iloc[i] > plat_res * 1.01 and d['change_pct'].iloc[i] >= 4
+                    and pd.notna(ma20_v) and d['volume'].iloc[i] >= ma20_v * 1.5):
+                bo_idx = i
+                break
+        if bo_idx is not None and amp <= 0.25:
+            since = len(d) - 1 - bo_idx
+            pulled_back = (low_t <= plat_res * 1.03 and close_t >= plat_res * 0.97
+                           and close_t <= plat_res * 1.15)
+            if 1 <= since <= 7 and pulled_back:
+                bo_high = max(float(d['high'].iloc[bo_idx]), plat_res)
+                hit = _dip_hit(
+                    'break_pull', plat_res * 1.005, plat_res * 0.96,
+                    bo_high + (plat_res - plat_low),
+                    [f'平台上沿 {plat_res:.2f}（振幅 {amp * 100:.0f}%）',
+                     f'{since} 天前放量突破，涨幅 {float(d["change_pct"].iloc[bo_idx]):.1f}%',
+                     '今日回踩压力转支撑，未跌破平台上沿'],
+                    '压力位转支撑处低吸，跌破平台上沿3%止损',
+                )
+                if hit:
+                    hits.append(hit)
+
+    # ---- 形态3：换手假阴（连板后放量假阴真阳）----
+    c2 = float(d['change_pct'].iloc[-2])
+    c3 = float(d['change_pct'].iloc[-3])
+    fake_yin = close_t < open_t and close_t > float(prev['close'])
+    heavy = vol_t >= _num(d['vol_ma5'].iloc[-1]) * 1.6 and vol_t >= _num(d['vol_ma20'].iloc[-1]) * 1.8
+    if c2 >= limit and c3 >= limit and fake_yin and heavy:
+        hit = _dip_hit(
+            'fake_yin', close_t, low_t * 0.975, float(prev['close']) * (1 + limit / 100 * 0.8),
+            [f'前两日连续涨停（{c3:+.1f}% / {c2:+.1f}%）',
+             f'今日放量{vol_t / max(_num(d["vol_ma5"].iloc[-1], 1), 1):.1f}倍，收假阴真阳',
+             '2~3板位置换手充分，博弈次日'],
+            '放量假阴当天低吸，次日不涨离场',
+        )
+        if hit:
+            hits.append(hit)
+
+    # ---- 形态4：龙头首阴套利（一大波后第一根阴线）----
+    win = d.iloc[-11:-1]
+    boards10 = int((win['change_pct'] >= limit).sum())
+    gain10 = (float(win['close'].iloc[-1]) - float(win['close'].iloc[0])) / float(win['close'].iloc[0]) if float(win['close'].iloc[0]) else 0
+    is_yin = close_t < open_t and close_t < float(prev['close'])
+    drop = float(last['change_pct'])
+    prior = d.iloc[-9:-1]
+    first_yin = bool((prior['close'] >= prior['open']).all())
+    if boards10 >= 2 and gain10 >= 0.2 and is_yin and -8 <= drop <= -0.5 and first_yin:
+        hit = _dip_hit(
+            'first_yin', close_t, low_t * 0.97, close_t * 1.06,
+            [f'近10日涨停 {boards10} 次，累计 {gain10 * 100:.1f}%',
+             f'今日为本波第一根阴线（{drop:+.1f}%）',
+             '龙头首阴承接尚在，属纯套利'],
+            '次日无论盈亏一律离场，不格局',
+            level='套利',
+        )
+        if hit:
+            hits.append(hit)
+
+    # ---- 形态5：二波低吸（高标回调企稳，三连阳确认）----
+    max_boards = 0
+    cur_boards = 0
+    for x in d['change_pct'].iloc[-70:]:
+        if x >= limit:
+            cur_boards += 1
+            max_boards = max(max_boards, cur_boards)
+        else:
+            cur_boards = 0
+    hi70 = float(d['high'].iloc[-70:].max())
+    dd = (hi70 - close_t) / hi70 if hi70 > 0 else 0
+    ma10_v, ma20_v = _num(d['ma10'].iloc[-1]), _num(d['ma20'].iloc[-1])
+    near_ma = min(
+        abs(close_t - ma10_v) / ma10_v if ma10_v else 9,
+        abs(close_t - ma20_v) / ma20_v if ma20_v else 9,
+    )
+    shrink = _num(d['vol_ma5'].iloc[-1]) < _num(d['vol_ma20'].iloc[-1]) * 0.85
+    yang = 0
+    for i in range(len(d) - 1, len(d) - 5, -1):
+        if d['close'].iloc[i] > d['open'].iloc[i]:
+            yang += 1
+        else:
+            break
+    if max_boards >= 5 and 0.12 <= dd <= 0.45 and near_ma <= 0.05 and shrink and yang >= 2:
+        confirmed = yang >= 3
+        hit = _dip_hit(
+            'second_wave', close_t, min(float(d['low'].iloc[-3:].min()), ma20_v or low_t) * 0.97,
+            close_t * (1 + limit / 100),
+            [f'前高 {hi70:.2f}（最高 {max_boards} 连板），回撤 {dd * 100:.1f}%',
+             f'回踩10/20日线企稳（偏离 {near_ma * 100:.1f}%），缩量',
+             f'已收 {yang} 连阳' + ('，第三根阳线确认' if confirmed else '，等第三根阳线')],
+            '吃到一个涨停离场；走双头结构在双头位置直接走',
+            level='确认' if confirmed else '观察',
+        )
+        if hit:
+            hits.append(hit)
+
+    if not hits:
+        return []
+
+    if warn_long_shadow:
+        for h in hits:
+            h['score'] = round(max(0, h['score'] - 8), 1)
+            h['reasons'].append('⚠️ 今日放量长上影，警惕高位出货（扣8分）')
+
+    hits.sort(key=lambda x: x['score'], reverse=True)
+    return hits
+
+
+def save_dip_opportunities(items, trade_date):
+    payload = {'trade_date': trade_date, 'count': len(items), 'items': items}
+    kv_set('dip:latest', payload)
+
+
 # ============ 追踪更新 ============
 
 def update_tracking():
@@ -1282,6 +1525,7 @@ def main():
     stock_pool = get_dynamic_stock_pool()
     print(f"\n开始抓取 A股数据（共{len(stock_pool)}只，{MAX_WORKERS}线程并发）...")
     candidates = []
+    dip_hits = []
     success_count = 0
     latest_data_date = None
     done_count = [0]
@@ -1310,6 +1554,9 @@ def main():
             sr = detect_steady_rise(df)
             if sr:
                 out['steady_rise'] = sr
+            dip = detect_dip_patterns(df, code)
+            if dip:
+                out['dip'] = dip
             return out
         except Exception as e:
             print(f"  {code} 处理异常: {e}")
@@ -1338,6 +1585,8 @@ def main():
             if res.get('steady_rise'):
                 save_signal(res['code'], res['name'], today, '放量上涨', res['steady_rise'])
                 print(f"  放量上涨: {res['name']}({res['code']}) 3日{res['steady_rise']['total_pct']:.1f}%")
+            for h in res.get('dip') or []:
+                dip_hits.append({**h, 'code': res['code'], 'name': res['name']})
             if done_count[0] % 50 == 0:
                 print(f"进度: {done_count[0]}/{len(stock_pool)}，成功抓取 {success_count} 只")
 
@@ -1359,9 +1608,27 @@ def main():
                     save_signal(res['code'], res['name'], today, '涨停', res['limit_up'])
                 if res.get('steady_rise'):
                     save_signal(res['code'], res['name'], today, '放量上涨', res['steady_rise'])
+                for h in res.get('dip') or []:
+                    dip_hits.append({**h, 'code': res['code'], 'name': res['name']})
             time.sleep(0.2)
 
     print(f"全池抓取与检测耗时 {elapsed()}（{success_count}/{len(stock_pool)} 只成功）")
+
+    # --- 龙头低吸形态汇总 ---
+    if dip_hits:
+        dip_hits.sort(key=lambda x: (x['score'], x['rr']), reverse=True)
+        top_dip = dip_hits[:DIP_MAX_ITEMS]
+        for it in top_dip:
+            c = kv_get(f'concepts:{it["code"]}')
+            if c and c.get('concepts'):
+                it['concepts'] = c['concepts'][:4]
+        save_dip_opportunities(top_dip, today)
+        names = {v['name'] for v in DIP_PATTERNS.values()}
+        print(f"低吸形态命中 {len(dip_hits)} 只，保存前 {len(top_dip)} 只 " +
+              '／'.join(f"{n}:{sum(1 for x in top_dip if x['pattern_name'] == n)}" for n in names))
+    else:
+        print("未发现低吸形态")
+
     candidates.sort(key=lambda x: x['score'], reverse=True)
     for rank, c in enumerate(candidates[:20], 1):
         supabase.table('candidates').update({'rank': rank}).eq('code', c['code']).eq('trade_date', today).execute()
@@ -1401,6 +1668,7 @@ def main():
                 'today': today,
                 'stale': stale,
                 'candidates': len(candidates),
+                'dip': len(dip_hits),
                 'pool': len(stock_pool),
                 'fetched': success_count,
             }, ensure_ascii=False)

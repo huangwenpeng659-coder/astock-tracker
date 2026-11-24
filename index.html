@@ -125,6 +125,7 @@ function safeParse(v, fallback){
 
 const VIEWS = [
   {id:'radar',name:'机会雷达',icon:'🎯'},
+  {id:'dip',name:'低吸机会',icon:'🎣'},
   {id:'watchlist',name:'自选股',icon:'⭐'},
   {id:'tsignals',name:'做T信号',icon:'🔄'},
   {id:'analysis',name:'个股分析',icon:'📈'},
@@ -648,28 +649,24 @@ let tExtra = {};
 
 async function loadTExtra(){
   try{
-    const {data,error}=await sb.from('config').select('key,value');
+    const {data,error}=await sb.from('config').select('key,value').like('key','tstr:%');
     if(error) return;
     (data||[]).forEach(r=>{
-      const k=r.key||'';
-      if(!k.startsWith('tstr:')) return;
-      const code=k.split(':')[1];
-      tExtra[code]=safeParse(r.value,{});
+      const code=(r.key||'').split(':')[1];
+      if(code) tExtra[code]=safeParse(r.value,{});
     });
   }catch(e){console.error('加载做T附加信息失败:',e);}
 }
 
 async function loadConcepts(){
   try{
-    const {data,error}=await sb.from('config').select('key,value');
+    const {data,error}=await sb.from('config').select('key,value').like('key','concepts:%');
     if(error){console.error('加载概念失败:',error);return;}
     (data||[]).forEach(r=>{
-      const k=r.key||'';
-      if(!k.startsWith('concepts:')) return;
-      const code=k.split(':')[1];
+      const code=(r.key||'').split(':')[1];
       const payload=safeParse(r.value,{});
       const v=payload&&payload.concepts?payload.concepts:[];
-      conceptMap[code]=Array.isArray(v)?v:[];
+      if(code) conceptMap[code]=Array.isArray(v)?v:[];
     });
   }catch(e){console.error('加载概念失败:',e);}
 }
@@ -677,6 +674,82 @@ async function loadConcepts(){
 function getConcepts(code){
   const c=conceptMap[code]||[];
   return c.slice(0,6).map(x=>`<span class="badge" style="background:rgba(56,189,248,.12);color:#38bdf8;border:1px solid rgba(56,189,248,.25);font-size:11px">${x}</span>`).join(' ');
+}
+
+let dipData = null;
+
+async function loadDip(){
+  try{
+    const {data,error}=await sb.from('config').select('value').eq('key','dip:latest').limit(1);
+    if(error){console.error('加载低吸机会失败:',error);return;}
+    if(data&&data.length) dipData=safeParse(data[0].value,null);
+  }catch(e){console.error('加载低吸机会失败:',e);}
+}
+
+const DIP_ICON={
+  '黄金坑低吸':'🕳️','突破回踩低吸':'🎯','换手假阴低吸':'🔄','龙头首阴套利':'⚡','二波低吸':'🌊'
+};
+
+function renderDip(){
+  const items=(dipData&&dipData.items)||[];
+  if(!items.length){
+    return `<div class="card">
+      <div class="card-title"><div class="t"><span class="dot"></span>龙头低吸机会</div></div>
+      <div class="loading" style="padding:24px">暂未命中低吸形态，每日收盘后自动扫描</div>
+    </div>
+    <div class="notice">只低吸有辨识度的题材龙头/中军，不做杂毛；低吸赚的是盈亏比，没有盈亏比就不做</div>`;
+  }
+
+  const counts={};
+  items.forEach(it=>{counts[it.pattern_name]=(counts[it.pattern_name]||0)+1;});
+  const summary=Object.entries(counts)
+    .map(([n,c])=>`<span class="badge" style="background:rgba(139,92,246,.12);color:#a78bfa;border:1px solid rgba(139,92,246,.25)">${DIP_ICON[n]||''}${n} ${c}</span>`)
+    .join(' ');
+
+  const cards=items.map(it=>{
+    const lvlClass=it.level==='观察'?'risk':it.level==='套利'?'risk':'buy';
+    const dropPct=((it.entry-it.stop)/it.entry*100).toFixed(1);
+    const concepts=(it.concepts||[]).slice(0,4)
+      .map(x=>`<span class="badge" style="background:rgba(56,189,248,.12);color:#38bdf8;border:1px solid rgba(56,189,248,.25)">${x}</span>`).join(' ');
+    const reasons=(it.reasons||[]).map(r=>`<div style="font-size:12px;color:var(--sub);margin-top:3px">· ${r}</div>`).join('');
+    return `<div class="card" style="border-left:3px solid ${it.score>=75?'var(--up)':it.score>=65?'var(--gold)':'var(--brand)'}">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px">
+        <div>
+          <div class="stock-name">${it.name} <span class="stock-code">${it.code}</span></div>
+          <div style="margin-top:6px">${concepts}</div>
+        </div>
+        <div style="text-align:right;flex-shrink:0">
+          <div class="score">${it.score}</div>
+          <div class="score-l">评分</div>
+        </div>
+      </div>
+      <div style="margin:10px 0 8px;display:flex;gap:6px;flex-wrap:wrap">
+        <span class="badge" style="background:rgba(139,92,246,.15);color:#a78bfa;border:1px solid rgba(139,92,246,.3)">${DIP_ICON[it.pattern_name]||''} ${it.pattern_name}</span>
+        <span class="badge ${lvlClass}">${it.level}</span>
+        <span class="badge watch">盈亏比 ${it.rr}</span>
+        <span class="badge" style="background:var(--card2);color:var(--sub)">止损 ${dropPct}%</span>
+      </div>
+      <div class="plan">
+        <span>买点 <b style="color:var(--gold)">${it.entry}</b></span>
+        <span>止损 <b style="color:var(--down)">${it.stop}</b></span>
+        <span>目标 <b style="color:var(--up)">${it.target}</b></span>
+      </div>
+      <div style="margin-top:10px">${reasons}</div>
+      ${it.note?`<div style="margin-top:10px;font-size:12px;color:var(--gold);background:rgba(245,185,66,.08);border-left:2px solid var(--gold);padding:8px 10px;border-radius:6px">纪律：${it.note}</div>`:''}
+    </div>`;
+  }).join('');
+
+  return `<div class="card">
+      <div class="card-title"><div class="t"><span class="dot" style="background:var(--purple);box-shadow:0 0 8px var(--purple)"></span>龙头低吸机会</div>
+        <span class="sub">${dipData.trade_date||''} · ${items.length} 只</span></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">${summary}</div>
+    </div>
+    ${cards}
+    <div class="notice">
+      低吸只做有辨识度的题材龙头/中军，不做杂毛<hr style="border:none;border-top:1px solid var(--border);margin:10px 0">
+      盈亏比&lt;1.2 的形态已扣分，可自行过滤<hr style="border:none;border-top:1px solid var(--border);margin:10px 0">
+      所有价格均为收盘后计算，次日开盘价格可能已偏离买点，务必自行复核并严格止损
+    </div>`;
 }
 
 let backtestData = {};
@@ -1053,6 +1126,7 @@ async function render(){
   const v = document.getElementById('view');
   const banner=renderBanner();
   if(cur==='radar') v.innerHTML = banner+renderRadar();
+  else if(cur==='dip') v.innerHTML = banner+renderDip();
   else if(cur==='watchlist') v.innerHTML = banner+renderWatchlist();
   else if(cur==='tsignals') v.innerHTML = banner+renderTSignals();
   else if(cur==='analysis'){ v.innerHTML = banner+renderAnalysis(); setTimeout(initKline,50); setTimeout(renderTStrategy,200); }
@@ -1138,6 +1212,7 @@ async function init(){
   await loadLastRun();
   await loadBacktest();
   await loadConcepts();
+  await loadDip();
   await loadWatchlist();
   await loadTExtra();
   await loadTSignals();
