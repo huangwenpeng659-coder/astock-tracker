@@ -1200,6 +1200,68 @@ def detect_dip_patterns(df, code):
     return hits
 
 
+# ---------- 连板池：低吸形态专用股票池（主池沪深300几乎没有连板股） ----------
+DIP_POOL_TTL_DAYS = 20      # 涨停票在池子里保留的天数
+DIP_POOL_MIN_PCT = 9.0      # 涨幅达标的才进池（10cm靠近涨停，20cm也算）
+DIP_POOL_MAX = 200          # 池子上限，控制抓取耗时
+SINA_HOT_URL = ('https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php'
+                '/Market_Center.getHQNodeData')
+
+
+def fetch_hot_stocks(min_pct=DIP_POOL_MIN_PCT):
+    """新浪涨幅榜前100，取涨幅达标的（当日涨停/连板/大阳）"""
+    params = {'page': 1, 'num': 100, 'sort': 'changepercent', 'asc': 0, 'node': 'hs_a'}
+    resp = requests.get(SINA_HOT_URL, params=params, timeout=15,
+                        headers={'User-Agent': 'Mozilla/5.0',
+                                 'Referer': 'https://vip.stock.finance.sina.com.cn/'})
+    resp.raise_for_status()
+    out = []
+    for it in resp.json() or []:
+        try:
+            pct = float(it.get('changepercent') or 0)
+        except (TypeError, ValueError):
+            continue
+        code = str(it.get('code') or '').zfill(6)
+        name = str(it.get('name') or '')
+        if not code or pct < min_pct:
+            continue
+        if 'ST' in name.upper() or '退' in name:
+            continue
+        out.append((code, name))
+    return out
+
+
+def build_dip_pool():
+    """今日涨幅榜 + 近20个自然日的热度票，滚动维护（存 config KV）"""
+    today = now_cn().date()
+    stored = kv_get('dip_pool') or {}
+    pool = {}
+    for code, v in stored.items():
+        try:
+            if datetime.strptime(v['expire'], '%Y-%m-%d').date() >= today:
+                pool[code] = v
+        except Exception:
+            continue
+
+    try:
+        hot = fetch_hot_stocks()
+    except Exception as e:
+        print(f"获取涨幅榜失败: {e}")
+        hot = []
+
+    expire = (today + timedelta(days=DIP_POOL_TTL_DAYS)).strftime('%Y-%m-%d')
+    for code, name in hot:
+        pool[code] = {'name': name, 'expire': expire, 'last_hot': today.strftime('%Y-%m-%d')}
+
+    if len(pool) > DIP_POOL_MAX:
+        pool = dict(sorted(pool.items(),
+                           key=lambda kv: kv[1].get('last_hot', ''), reverse=True)[:DIP_POOL_MAX])
+
+    kv_set('dip_pool', pool)
+    print(f"连板池: 今日新增 {len(hot)} 只，池内共 {len(pool)} 只")
+    return [(c, v.get('name')) for c, v in pool.items()]
+
+
 def save_dip_opportunities(items, trade_date):
     payload = {'trade_date': trade_date, 'count': len(items), 'items': items}
     kv_set('dip:latest', payload)
@@ -1646,6 +1708,38 @@ def main():
             time.sleep(0.2)
 
     print(f"全池抓取与检测耗时 {elapsed()}（{success_count}/{len(stock_pool)} 只成功）")
+
+    # --- 连板池低吸扫描（主池是沪深300，低吸形态需要连板股，单独扫热度池）---
+    try:
+        scanned = {c for c, _ in stock_pool}
+        hot_pool = [(c, n) for c, n in build_dip_pool() if c not in scanned]
+    except Exception as e:
+        print(f"构建连板池失败: {e}")
+        hot_pool = []
+
+    if hot_pool:
+        print(f"\n扫描连板池 {len(hot_pool)} 只...")
+
+        def _dip_scan(item):
+            code, pname = item
+            try:
+                df = fetch_and_save_kline(code)
+                if df is None or len(df) < 45:
+                    return None
+                hits = detect_dip_patterns(df, code)
+                if not hits:
+                    return None
+                return {'code': code, 'name': get_stock_name(code, pname), 'hits': hits}
+            except Exception as e:
+                print(f"  {code} 低吸扫描异常: {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            for res in ex.map(_dip_scan, hot_pool):
+                if res:
+                    for h in res['hits']:
+                        dip_hits.append({**h, 'code': res['code'], 'name': res['name']})
+        print(f"连板池扫描完成，耗时 {elapsed()}")
 
     # --- 龙头低吸形态汇总 ---
     dip_hits.sort(key=lambda x: (x['score'], x['rr']), reverse=True)
