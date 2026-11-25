@@ -1,4 +1,4 @@
-"""自选股盘中放量检测 -> PushPlus 推送微信文件助手"""
+"""自选股盘中放量检测 -> 通过 PushPlus 公众号推送到本人微信"""
 import os
 import json
 from datetime import datetime
@@ -16,7 +16,7 @@ except Exception:
 
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_SERVICE_KEY') or os.getenv('SUPABASE_KEY')
-PUSHPLUS_TOKEN = os.getenv('PUSHPLUS_TOKEN', 'cef6de3969a64da381519bb3bf87a6fe')
+PUSHPLUS_TOKEN = os.getenv('PUSHPLUS_TOKEN', '')
 FORCE_RUN = os.getenv('FORCE_RUN') == '1'
 
 VOL_RATIO = float(os.getenv('VOL_RATIO', '2.0'))
@@ -162,6 +162,9 @@ def detect_volume_surge(code, name):
 
 
 def push_to_pushplus(title, content):
+    if not PUSHPLUS_TOKEN:
+        print('未配置 PUSHPLUS_TOKEN，跳过推送（在仓库 Settings → Secrets 里加）')
+        return False
     try:
         resp = requests.post(
             'https://www.pushplus.plus/send',
