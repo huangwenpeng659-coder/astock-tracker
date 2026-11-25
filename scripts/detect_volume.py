@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 
 import akshare as ak
+import pandas as pd
 import requests
 from supabase import create_client
 
@@ -21,6 +22,8 @@ FORCE_RUN = os.getenv('FORCE_RUN') == '1'
 VOL_RATIO = float(os.getenv('VOL_RATIO', '2.0'))
 BAR_PERIOD = '5'
 HIST_BARS = 20
+UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/120.0 Safari/537.36')
 
 sb = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
@@ -62,19 +65,60 @@ def get_watchlist():
         return []
 
 
-def get_intraday_bars(code):
-    """取当日 5 分钟 K 线（akshare 返回多日，需按日期截断）"""
-    try:
-        df = ak.stock_zh_a_hist_min_em(symbol=code, period=BAR_PERIOD)
-    except Exception as e:
-        print(f'获取 {code} 分钟K线失败: {e}')
+def _sina_symbol(code):
+    c = str(code).zfill(6)
+    if c.startswith(('6', '9')):
+        return 'sh' + c
+    if c.startswith(('4', '8')):
+        return 'bj' + c
+    return 'sz' + c
+
+
+def _sina_min_bars(code):
+    url = ('https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData'
+           f'?symbol={_sina_symbol(code)}&scale={BAR_PERIOD}&ma=no&datalen=200')
+    resp = requests.get(url, headers={'User-Agent': UA}, timeout=10)
+    resp.raise_for_status()
+    rows = resp.json()
+    if not rows:
         return None
+    df = pd.DataFrame(rows).rename(columns={'day': 'time'})
+    for col in ('open', 'high', 'low', 'close', 'volume'):
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df['volume'] = df['volume'] / 100   # 新浪给的是股，统一换成手
+    df['date'] = df['time'].astype(str).str[:10]
+    return df.dropna(subset=['close', 'volume'])
+
+
+def _em_min_bars(code):
+    df = ak.stock_zh_a_hist_min_em(symbol=code, period=BAR_PERIOD)
     if df is None or df.empty:
         return None
+    df = df.rename(columns={'时间': 'time', '开盘': 'open', '最高': 'high',
+                            '最低': 'low', '收盘': 'close', '成交量': 'volume'})
+    df['date'] = df['time'].astype(str).str[:10]
+    for col in ('open', 'high', 'low', 'close', 'volume'):
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df.dropna(subset=['close', 'volume'])
 
-    df['时间'] = df['时间'].astype(str).str.slice(0, 10)
-    last_day = df['时间'].iloc[-1]
-    today_df = df[df['时间'] == last_day].reset_index(drop=True)
+
+def get_intraday_bars(code):
+    """取最近交易日当天的 5 分钟 K 线：新浪为主，东财兜底（东财常拦云服务器 IP）"""
+    df = None
+    for fetch in (_sina_min_bars, _em_min_bars):
+        try:
+            df = fetch(code)
+        except Exception as e:
+            print(f'  {code} {fetch.__name__} 失败: {e}')
+            df = None
+        if df is not None and not df.empty:
+            break
+    if df is None or df.empty:
+        print(f'获取 {code} 分钟K线失败：所有数据源均不可用')
+        return None
+
+    last_day = df['date'].iloc[-1]
+    today_df = df[df['date'] == last_day].reset_index(drop=True)
     return today_df if len(today_df) >= 5 else None
 
 
@@ -83,8 +127,8 @@ def detect_volume_surge(code, name):
     if df is None:
         return None
 
-    volumes = df['成交量'].astype(float)
-    closes = df['收盘'].astype(float)
+    volumes = df['volume'].astype(float)
+    closes = df['close'].astype(float)
 
     current_vol = volumes.iloc[-1]
     history = volumes.iloc[:-1].tail(HIST_BARS)
@@ -112,7 +156,7 @@ def detect_volume_surge(code, name):
         'vol_ratio': round(ratio, 2),
         'close': round(float(close), 2),
         'pct_change': round(float(pct), 2),
-        'bar_time': str(df['时间'].iloc[-1]) if '时间' in df else '',
+        'bar_time': str(df['time'].iloc[-1]),
         'time': now().strftime('%Y-%m-%d %H:%M:%S'),
     }
 
