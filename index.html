@@ -625,13 +625,45 @@ function renderReview(){
 
 async function loadWatchlist(){
   try{
-    const {data}=await sb.from('watchlist').select('*').order('created_at');
-    watchlist=data||[];
+    const {data}=await sb.from('watchlist').select('*').order('created_at',{ascending:false});
+    const seen=new Set();
+    watchlist=(data||[]).filter(w=>{
+      if(!w.code||seen.has(w.code)) return false;
+      seen.add(w.code);
+      return true;
+    });
   }catch(e){watchlist=[];}
   try{
     const {data}=await sb.from('stock_scores').select('*').order('score',{ascending:false});
     (data||[]).forEach(s=>{watchScores[s.code]=s;});
   }catch(e){}
+}
+
+function toast(msg, isErr){
+  let el=document.getElementById('toast');
+  if(!el){
+    el=document.createElement('div');
+    el.id='toast';
+    el.style.cssText='position:fixed;left:50%;bottom:96px;transform:translateX(-50%);'+
+      'border-radius:10px;padding:10px 18px;font-size:13px;z-index:200;'+
+      'box-shadow:0 6px 24px rgba(0,0,0,.4);transition:opacity .25s;pointer-events:none;max-width:80vw;text-align:center';
+    document.body.appendChild(el);
+  }
+  el.textContent=msg;
+  el.style.color='#fff';
+  el.style.background=isErr?'rgba(239,68,68,.95)':'rgba(37,99,235,.95)';
+  el.style.opacity='1';
+  clearTimeout(el._t);
+  el._t=setTimeout(()=>{el.style.opacity='0';},2000);
+}
+
+function focusStockCard(code){
+  const el=document.getElementById('wl-'+code);
+  if(!el) return;
+  el.scrollIntoView({behavior:'smooth',block:'center'});
+  el.style.transition='box-shadow .3s';
+  el.style.boxShadow='0 0 0 2px var(--brand)';
+  setTimeout(()=>{el.style.boxShadow='';},2200);
 }
 
 async function loadTSignals(){
@@ -805,29 +837,50 @@ async function loadLastRun(){
 
 async function addWatchStock(){
   const inp=document.getElementById('wl-input');
+  const btn=document.getElementById('wl-add');
   const val=(inp?.value||'').trim();
-  if(!val){alert('请输入股票代码或名称');return;}
+  if(!val){toast('请输入股票代码', true);return;}
   const code=val.replace(/[^0-9]/g,'');
-  if(code.length!==6){alert('请输入6位股票代码');return;}
+  if(code.length!==6){toast('请输入6位股票代码', true);return;}
+  if(btn&&btn.disabled) return;
+  if(btn) btn.disabled=true;
   try{
-    const {data:exist}=await sb.from('watchlist').select('code').eq('code',code);
-    if(exist&&exist.length){alert('该股票已在自选股中');return;}
+    const {data:exist}=await sb.from('watchlist').select('id').eq('code',code).limit(1);
+    if(exist&&exist.length){
+      await loadWatchlist();
+      render();
+      setTimeout(()=>focusStockCard(code),80);
+      toast(code+' 已在自选股中，已定位到该股票');
+      return;
+    }
     let name=val;
-    const {data:stock}=await sb.from('stocks').select('name').eq('code',code);
-    if(stock&&stock.length) name=stock[0].name;
-    await sb.from('watchlist').insert({code,name});
+    const {data:stock}=await sb.from('stocks').select('name').eq('code',code).limit(1);
+    if(stock&&stock.length&&stock[0].name) name=stock[0].name;
+    const {error}=await sb.from('watchlist').insert({code,name});
+    if(error) throw error;
+    if(inp) inp.value='';
     await loadWatchlist();
-    go('watchlist');
-  }catch(e){alert('添加失败: '+e.message);}
+    render();
+    setTimeout(()=>focusStockCard(code),80);
+    toast('已添加 '+code);
+  }catch(e){
+    toast('添加失败: '+(e.message||e), true);
+  }finally{
+    if(btn) btn.disabled=false;
+  }
 }
 
 async function removeWatchStock(code){
   try{
-    await sb.from('watchlist').delete().eq('code',code);
+    const {error}=await sb.from('watchlist').delete().eq('code',code);
+    if(error) throw error;
     delete watchScores[code];
     await loadWatchlist();
-    go('watchlist');
-  }catch(e){alert('删除失败: '+e.message);}
+    render();
+    toast('已删除 '+code);
+  }catch(e){
+    toast('删除失败: '+(e.message||e), true);
+  }
 }
 
 function gradeColor(g){
@@ -843,7 +896,7 @@ function renderWatchlist(){
       <div class="card-title"><div class="t"><span class="dot"></span>自选股</div></div>
       <div style="display:flex;gap:8px;margin-top:4px">
         <input id="wl-input" placeholder="输入6位股票代码，如 600519" style="flex:1;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 14px;font-size:14px;outline:none">
-        <button onclick="addWatchStock()" style="background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;border:none;border-radius:10px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer">添加</button>
+        <button id="wl-add" onclick="addWatchStock()" style="background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;border:none;border-radius:10px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer">添加</button>
       </div>
       <div class="loading" style="padding:20px">暂无自选股，添加后每日自动分析评分</div>
     </div>`;
@@ -868,7 +921,7 @@ function renderWatchlist(){
     ).join('');
     const t = tSignals[w.code] ? normalizeTData(tSignals[w.code]) : null;
     const tBadge = t ? `<span class="badge" style="background:rgba(139,92,246,.15);color:var(--purple);border:1px solid rgba(139,92,246,.3)">做T ${t.advice}</span>` : '';
-    return `<div class="card" onclick="selectStock('${w.code}');go('analysis')" style="cursor:pointer">
+    return `<div class="card" id="wl-${w.code}" onclick="selectStock('${w.code}');go('analysis')" style="cursor:pointer">
       <div style="display:flex;justify-content:space-between;align-items:center">
         <div>
           <div class="stock-name">${w.name||w.code} ${tBadge}</div>
@@ -894,8 +947,8 @@ function renderWatchlist(){
     <div class="card">
       <div class="card-title"><div class="t"><span class="dot"></span>自选股（${watchlist.length}只）</div></div>
       <div style="display:flex;gap:8px;margin-top:4px">
-        <input id="wl-input" placeholder="输入6位股票代码，如 600519" style="flex:1;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 14px;font-size:14px;outline:none">
-        <button onclick="addWatchStock()" style="background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;border:none;border-radius:10px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer">添加</button>
+        <input id="wl-input" placeholder="输入6位股票代码，如 600519" onkeydown="if(event.key==='Enter')addWatchStock()" style="flex:1;background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:10px;padding:10px 14px;font-size:14px;outline:none">
+        <button id="wl-add" onclick="addWatchStock()" style="background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;border:none;border-radius:10px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer">添加</button>
       </div>
     </div>
     ${items}
@@ -1161,7 +1214,12 @@ async function render(){
   else if(cur==='settings') v.innerHTML = banner+renderSettings();
   window.scrollTo(0,0);
 }
-function go(id){ cur=id; render(); }
+function go(id){
+  cur=id;
+  render();
+  // 切回自选股时重新拉一次，避免看到打开页面时的旧快照
+  if(id==='watchlist') loadWatchlist().then(render);
+}
 
 let deferredPrompt = null;
 
