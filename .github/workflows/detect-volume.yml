@@ -3,8 +3,9 @@ name: 放量检测与推送
 on:
   schedule:
     # GitHub cron 用 UTC。北京时间 08:00-18:00 = UTC 00:00-10:00
-    # 定时任务经常延迟几十分钟，所以放宽窗口，由脚本内的交易时段判断（9:30-11:30 / 13:00-15:00）过滤
-    - cron: '*/15 0-9 * * 1-5'
+    # 高频 cron 在公共仓库会被大量丢弃，用 30 分钟一档提高执行率；
+    # 交易时段由脚本内判断（9:15-11:35 / 12:55-15:35，含收盘后缓冲）过滤
+    - cron: '*/30 0-9 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -29,6 +30,8 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          # 备用通道：Server酱 SendKey（PushPlus 未实名认证时启用）
+          SCT_SENDKEY: ${{ secrets.SCT_SENDKEY }}
           TZ: Asia/Shanghai
           # 手动触发时跳过交易时段限制，便于测试
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}

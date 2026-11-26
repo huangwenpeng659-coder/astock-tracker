@@ -166,6 +166,21 @@ def get_sina_symbol(code):
 NAME_MAP = {}
 _NAME_MAP_LOADED = False
 
+def _load_name_map_em():
+    """东财全市场名称表（一次请求取全部 A 股），akshare 失败时兜底"""
+    url = 'https://push2.eastmoney.com/api/qt/clist/get'
+    params = {
+        'pn': 1, 'pz': 6000, 'po': 0, 'np': 1, 'fltt': 2, 'invt': 2, 'fid': 'f12',
+        'fs': 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048',
+        'fields': 'f12,f14',
+        'ut': 'bd1d9ddb04089700cf9c27f6f7426281',
+    }
+    data = _http_json(url, params)
+    items = ((data or {}).get('data') or {}).get('diff') or []
+    return {str(it['f12']).zfill(6): str(it['f14']).strip()
+            for it in items if it.get('f12') and it.get('f14')}
+
+
 def load_name_map():
     global NAME_MAP, _NAME_MAP_LOADED
     if _NAME_MAP_LOADED:
@@ -173,9 +188,15 @@ def load_name_map():
     try:
         df = ak.stock_info_a_code_name()
         NAME_MAP = {str(r['code']).zfill(6): str(r['name']).strip() for _, r in df.iterrows()}
-        print(f"加载A股中文名映射 {len(NAME_MAP)} 只")
+        print(f"加载A股中文名映射 {len(NAME_MAP)} 只（akshare）")
     except Exception as e:
-        print(f"加载中文名映射失败: {e}")
+        print(f"akshare 名称表加载失败({e})，改用东财全市场列表")
+        try:
+            NAME_MAP = _load_name_map_em()
+            print(f"加载A股中文名映射 {len(NAME_MAP)} 只（东财）")
+        except Exception as e2:
+            print(f"东财名称表也失败: {e2}")
+            NAME_MAP = {}
     _NAME_MAP_LOADED = True
     return NAME_MAP
 
@@ -250,11 +271,17 @@ def save_stock_concepts(code, name, concepts):
     kv_set(f'concepts:{code}', {'name': name, 'concepts': concepts})
 
 def save_stock_basic(code, name):
+    row = {'code': code, 'name': name, 'is_st': False, 'is_delisted': False}
     try:
-        supabase.table('stocks').upsert({
-            'code': code, 'name': name,
-            'is_st': False, 'is_delisted': False
-        }, on_conflict='code').execute()
+        supabase.table('stocks').upsert(row, on_conflict='code').execute()
+        return
+    except Exception as e:
+        print(f"stocks upsert 失败 {code}: {e}")
+    try:
+        # 表上没有 code 唯一约束时，退回"先查再插"
+        exists = supabase.table('stocks').select('code').eq('code', code).limit(1).execute()
+        if not exists.data:
+            supabase.table('stocks').insert(row).execute()
     except Exception as e:
         print(f"保存股票信息失败 {code}: {e}")
 
@@ -1603,6 +1630,7 @@ def main():
         for item in watchlist:
             code = item['code']
             name = get_stock_name(code, item.get('name'))
+            save_stock_basic(code, name)
             df = fetch_and_save_kline(code)
             if df is None or len(df) < 20:
                 print(f"  {name}({code}) 数据不足，跳过")

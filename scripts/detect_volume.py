@@ -17,6 +17,7 @@ except Exception:
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_SERVICE_KEY') or os.getenv('SUPABASE_KEY')
 PUSHPLUS_TOKEN = os.getenv('PUSHPLUS_TOKEN', '')
+SCT_SENDKEY = os.getenv('SCT_SENDKEY', '')
 FORCE_RUN = os.getenv('FORCE_RUN') == '1'
 
 VOL_RATIO = float(os.getenv('VOL_RATIO', '2.0'))
@@ -33,8 +34,9 @@ def now():
 
 
 def in_trading_hours(dt):
+    """含开盘前竞价与收盘后缓冲：GitHub 定时任务常延迟，15:35 前仍按当天数据处理"""
     hm = dt.hour * 60 + dt.minute
-    return (9 * 60 + 30 <= hm <= 11 * 60 + 30) or (13 * 60 <= hm <= 15 * 60)
+    return (9 * 60 + 15 <= hm <= 11 * 60 + 35) or (12 * 60 + 55 <= hm <= 15 * 60 + 35)
 
 
 def kv_get(key):
@@ -102,6 +104,54 @@ def _em_min_bars(code):
     return df.dropna(subset=['close', 'volume'])
 
 
+_NAME_CACHE = {}
+_NAME_MAP = None
+
+
+def load_name_map():
+    """A股代码→中文名：akshare 优先，失败用东财全市场列表兜底"""
+    global _NAME_MAP
+    if _NAME_MAP is not None:
+        return _NAME_MAP
+    _NAME_MAP = {}
+    try:
+        df = ak.stock_info_a_code_name()
+        _NAME_MAP = {str(r['code']).zfill(6): str(r['name']).strip() for _, r in df.iterrows()}
+        print(f'加载中文名映射 {len(_NAME_MAP)} 只（akshare）')
+    except Exception as e:
+        print(f'akshare 名称表失败({e})，改用东财列表')
+        try:
+            resp = requests.get('https://push2.eastmoney.com/api/qt/clist/get', timeout=20,
+                                 headers={'User-Agent': UA}, params={
+                                     'pn': 1, 'pz': 6000, 'po': 0, 'np': 1, 'fltt': 2, 'invt': 2,
+                                     'fid': 'f12', 'fields': 'f12,f14',
+                                     'fs': 'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048',
+                                     'ut': 'bd1d9ddb04089700cf9c27f6f7426281'})
+            items = (resp.json().get('data') or {}).get('diff') or []
+            _NAME_MAP = {str(i['f12']).zfill(6): str(i['f14']).strip()
+                         for i in items if i.get('f12') and i.get('f14')}
+            print(f'加载中文名映射 {len(_NAME_MAP)} 只（东财）')
+        except Exception as e2:
+            print(f'东财名称表失败: {e2}')
+    return _NAME_MAP
+
+
+def stock_name(code):
+    """自选股里 name 常是代码，这里回查中文名"""
+    if code in _NAME_CACHE:
+        return _NAME_CACHE[code]
+    name = load_name_map().get(code) or code
+    if name == code:
+        try:
+            resp = sb.table('stocks').select('name').eq('code', code).limit(1).execute()
+            if resp.data and resp.data[0].get('name'):
+                name = resp.data[0]['name']
+        except Exception:
+            pass
+    _NAME_CACHE[code] = name
+    return name
+
+
 def get_intraday_bars(code):
     """取最近交易日当天的 5 分钟 K 线：新浪为主，东财兜底（东财常拦云服务器 IP）"""
     df = None
@@ -119,13 +169,17 @@ def get_intraday_bars(code):
 
     last_day = df['date'].iloc[-1]
     today_df = df[df['date'] == last_day].reset_index(drop=True)
+    # 15:00 那根是收盘集合竞价，成交量天然是平常的数倍，剔除否则收盘前后必然误报
+    if len(today_df) and str(today_df['time'].iloc[-1])[11:16] >= '15:00':
+        today_df = today_df.iloc[:-1].reset_index(drop=True)
     return today_df if len(today_df) >= 5 else None
 
 
 def detect_volume_surge(code, name):
+    """返回 (信号, 数据是否成功获取)"""
     df = get_intraday_bars(code)
     if df is None:
-        return None
+        return None, False
 
     volumes = df['volume'].astype(float)
     closes = df['close'].astype(float)
@@ -133,15 +187,15 @@ def detect_volume_surge(code, name):
     current_vol = volumes.iloc[-1]
     history = volumes.iloc[:-1].tail(HIST_BARS)
     if len(history) < 5:
-        return None
+        return None, True
 
     avg_vol = history.mean()
     if avg_vol <= 0:
-        return None
+        return None, True
 
     ratio = current_vol / avg_vol
     if ratio < VOL_RATIO:
-        return None
+        return None, True
 
     close = closes.iloc[-1]
     prev_close = closes.iloc[-2]
@@ -158,7 +212,7 @@ def detect_volume_surge(code, name):
         'pct_change': round(float(pct), 2),
         'bar_time': str(df['time'].iloc[-1]),
         'time': now().strftime('%Y-%m-%d %H:%M:%S'),
-    }
+    }, True
 
 
 def push_to_pushplus(title, content):
@@ -197,6 +251,23 @@ def build_card(s):
     </div>"""
 
 
+def push_to_serverchan(title, content):
+    """Server酱备用通道（PushPlus 未实名认证时用）"""
+    if not SCT_SENDKEY:
+        return False
+    try:
+        resp = requests.post(f'https://sctapi.ftqq.com/{SCT_SENDKEY}.send', timeout=10,
+                             data={'title': title, 'desp': content})
+        r = resp.json()
+        if r.get('code') == 0:
+            print('✓ Server酱推送成功')
+            return True
+        print(f'✗ Server酱推送失败: {r.get("message") or r}')
+    except Exception as e:
+        print(f'Server酱推送异常: {e}')
+    return False
+
+
 def format_push_message(signals):
     if len(signals) == 1:
         title = f"🚀 {signals[0]['name']} {signals[0]['type']} {signals[0]['vol_ratio']}x"
@@ -215,6 +286,24 @@ def save_signal(signal):
         print(f'保存信号失败: {e}')
 
 
+def report_status(ts, checked, signals, failed, skipped=False):
+    """每次运行都记录状态，前端可据此判断检测是否真的在跑"""
+    try:
+        kv_set('volume_last_check', {
+            'run_at': ts.strftime('%Y-%m-%d %H:%M:%S'),
+            'checked': checked,
+            'failed': failed,
+            'skipped': skipped,
+            'signals': [
+                {'code': s['code'], 'name': s['name'], 'type': s['type'],
+                 'ratio': s['vol_ratio'], 'pct': s['pct_change']}
+                for s in signals
+            ],
+        })
+    except Exception as e:
+        print(f'写入检测状态失败: {e}')
+
+
 def check_watchlist():
     if sb is None:
         print('缺少 SUPABASE_URL / SUPABASE_SERVICE_KEY，退出')
@@ -225,19 +314,33 @@ def check_watchlist():
 
     if not in_trading_hours(ts) and not FORCE_RUN:
         print('非交易时段，跳过（如需强制运行设置 FORCE_RUN=1）')
+        report_status(ts, 0, [], 0, skipped=True)
         return
 
     watchlist = get_watchlist()
     if not watchlist:
         print('自选股为空，跳过检测')
+        report_status(ts, 0, [], 0, skipped=True)
         return
 
     day = ts.strftime('%Y%m%d')
     fresh = []
+    failed = 0
     for stock in watchlist:
         code = str(stock['code']).zfill(6)
-        signal = detect_volume_surge(code, stock.get('name'))
-        if not signal:
+        name = stock.get('name') or code
+        if name == code:
+            name = stock_name(code)
+        try:
+            signal, ok = detect_volume_surge(code, name)
+        except Exception as e:
+            print(f'  {code} 检测异常: {e}')
+            failed += 1
+            continue
+        if not ok:
+            failed += 1
+            continue
+        if signal is None:
             continue
 
         save_signal(signal)
@@ -249,18 +352,27 @@ def check_watchlist():
             continue
 
         fresh.append(signal)
-        try:
-            kv_set(push_key, True)
-        except Exception:
-            pass
+
+    report_status(ts, len(watchlist), fresh, failed)
 
     if not fresh:
-        print('未检测到新的放量信号')
+        print(f'未检测到新的放量信号（检查 {len(watchlist)} 只，失败 {failed} 只）')
         return
 
     print(f'检测到 {len(fresh)} 个放量信号')
     title, content = format_push_message(fresh)
-    push_to_pushplus(title, content)
+    ok = push_to_pushplus(title, content)
+    if not ok:
+        ok = push_to_serverchan(title, content)
+    if ok:
+        # 只有推送成功才标记，避免失败后永远不再重试
+        for s in fresh:
+            try:
+                kv_set(f'volume_push:{s["code"]}:{day}', True)
+            except Exception:
+                pass
+    else:
+        print('推送失败，未标记为已推送，下次运行会重试')
 
 
 if __name__ == '__main__':

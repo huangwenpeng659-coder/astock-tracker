@@ -107,7 +107,7 @@ let cur = 'radar';
 let klineChart = null;
 let candidates = [];
 let selectedStock = null;
-let dailySignals = {limitUp:[], steadyRise:[]};
+let dailySignals = {limitUp:[], steadyRise:[], dates:{}};
 let conceptMap = {};
 let lastRun = null;
 let watchlist = [];
@@ -152,13 +152,37 @@ async function loadCandidates(){
 
 async function loadSignals(){
   try{
-    const {data:dateRows}=await sb.from('daily_signals').select('trade_date').order('trade_date',{ascending:false}).limit(1);
-    if(!dateRows||!dateRows.length) return;
-    const latest=dateRows[0].trade_date;
-    const {data}=await sb.from('daily_signals').select('*').eq('trade_date',latest);
-    dailySignals.limitUp=(data||[]).filter(d=>d.signal_type==='涨停');
-    dailySignals.steadyRise=(data||[]).filter(d=>d.signal_type==='放量上涨');
+    const types=[['涨停','limitUp'],['放量上涨','steadyRise']];
+    for(const [type,key] of types){
+      const {data:dateRows}=await sb.from('daily_signals')
+        .select('trade_date').eq('signal_type',type)
+        .order('trade_date',{ascending:false}).limit(1);
+      if(!dateRows||!dateRows.length){ dailySignals[key]=[]; dailySignals.dates[key]=null; continue; }
+      const latest=dateRows[0].trade_date;
+      const {data}=await sb.from('daily_signals').select('*')
+        .eq('signal_type',type).eq('trade_date',latest);
+      dailySignals[key]=data||[];
+      dailySignals.dates[key]=latest;
+    }
   }catch(e){console.error('加载信号失败:',e);}
+}
+
+let volCheck = null;
+
+async function loadVolCheck(){
+  try{
+    const {data}=await sb.from('config').select('value').eq('key','volume_last_check').limit(1);
+    if(data&&data.length) volCheck=safeParse(data[0].value,null);
+  }catch(e){console.error('加载放量检测状态失败:',e);}
+}
+
+function todayStr(){
+  return new Date().toLocaleDateString('sv-SE');
+}
+
+function signalDateLabel(d){
+  if(!d) return '';
+  return d===todayStr()?`${d} · 今日`:`${d} · 非当日`;
 }
 
 async function loadKline(code){
@@ -175,22 +199,25 @@ function renderRadar(){
   // 涨停板区
   let luHtml='';
   if(dailySignals.limitUp.length){
+    const luDate=signalDateLabel(dailySignals.dates.limitUp);
+    const stale=dailySignals.dates.limitUp!==todayStr();
     const luItems=dailySignals.limitUp.map(s=>{
       const d=s.details||{};
       return `<div class="row"><div><div class="stock-name">${s.name||s.code}(${s.code})</div></div><div class="up" style="font-weight:600">${fmt(s.price)} +${fmt(d.pct||0)}%</div></div>`;
     }).join('');
     luHtml=`<div class="card" style="border-color:rgba(239,68,68,.4)">
-      <div class="card-title"><div class="t"><span class="dot" style="background:var(--up);box-shadow:0 0 8px var(--up)"></span>当日涨停板</div><span class="badge buy">${dailySignals.limitUp.length}只</span></div>${luItems}</div>`;
+      <div class="card-title"><div class="t"><span class="dot" style="background:var(--up);box-shadow:0 0 8px var(--up)"></span>涨停板${stale?'（最近信号日）':''}</div><span class="badge buy">${dailySignals.limitUp.length}只 · ${luDate}</span></div>${luItems}${stale?`<div class="sub" style="font-size:11px;margin-top:8px">今天沪深300 内暂无涨停，以上为最近一个有涨停的交易日</div>`:''}</div>`;
   }
   // 放量上涨区
   let srHtml='';
   if(dailySignals.steadyRise.length){
+    const srDate=signalDateLabel(dailySignals.dates.steadyRise);
     const srItems=dailySignals.steadyRise.map(s=>{
       const d=s.details||{};
       return `<div class="row"><div><div class="stock-name">${s.name||s.code}(${s.code})</div><div class="stock-code">三日连阳放量</div></div><div class="up" style="font-weight:600">3日 +${fmt(d.total_pct||0)}%</div></div>`;
     }).join('');
     srHtml=`<div class="card" style="border-color:rgba(59,130,246,.4)">
-      <div class="card-title"><div class="t"><span class="dot"></span>三日稳步放量上涨</div><span class="badge watch">${dailySignals.steadyRise.length}只</span></div>${srItems}</div>`;
+      <div class="card-title"><div class="t"><span class="dot"></span>三日稳步放量上涨</div><span class="badge watch">${dailySignals.steadyRise.length}只 · ${srDate}</span></div>${srItems}</div>`;
   }
   // 候选列表
   const noData=!candidates.length&&!dailySignals.limitUp.length&&!dailySignals.steadyRise.length;
@@ -890,6 +917,26 @@ function gradeColor(g){
   return 'var(--down)';
 }
 
+function volCheckHtml(){
+  if(!volCheck) return '';
+  const ts=volCheck.run_at||'';
+  const isToday=ts.slice(0,10)===todayStr();
+  let msg;
+  if(volCheck.skipped) msg='最近一次运行不在交易时段，已跳过';
+  else{
+    msg=`检查 ${volCheck.checked||0} 只 · 命中 ${(volCheck.signals||[]).length} 只`;
+    if(volCheck.failed) msg+=` · 数据失败 ${volCheck.failed} 只`;
+  }
+  const hits=(volCheck.signals||[]).map(s=>
+    `<div class="row"><div><div class="stock-name">${s.name}(${s.code})</div><div class="stock-code">${s.type}</div></div><div class="up" style="font-weight:600">${s.ratio}倍</div></div>`
+  ).join('');
+  return `<div class="card">
+    <div class="card-title"><div class="t"><span class="dot" style="background:var(--purple);box-shadow:0 0 8px var(--purple)"></span>盘中放量监控</div><span class="sub">${ts||'--'}</span></div>
+    <div class="sub" style="font-size:12px">${msg}${isToday?'':' · ⚠️ 今天还没有检测记录'}</div>
+    ${hits}
+  </div>`;
+}
+
 function renderWatchlist(){
   if(!watchlist.length){
     return `<div class="card">
@@ -951,6 +998,7 @@ function renderWatchlist(){
         <button id="wl-add" onclick="addWatchStock()" style="background:linear-gradient(135deg,#1e3a8a,#2563eb);color:#fff;border:none;border-radius:10px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer">添加</button>
       </div>
     </div>
+    ${volCheckHtml()}
     ${items}
     <div class="notice">评分每天自动更新 · 点击K线页面查看详细分析</div>`;
 }
@@ -1218,7 +1266,7 @@ function go(id){
   cur=id;
   render();
   // 切回自选股时重新拉一次，避免看到打开页面时的旧快照
-  if(id==='watchlist') loadWatchlist().then(render);
+  if(id==='watchlist') Promise.all([loadWatchlist(),loadVolCheck()]).then(render);
 }
 
 let deferredPrompt = null;
@@ -1297,6 +1345,7 @@ async function init(){
   await loadBacktest();
   await loadConcepts();
   await loadDip();
+  await loadVolCheck();
   await loadWatchlist();
   await loadTExtra();
   await loadTSignals();
