@@ -1,6 +1,7 @@
 """自选股盘中放量检测 -> 通过 PushPlus 公众号推送到本人微信"""
 import os
 import json
+import re
 from datetime import datetime
 
 import akshare as ak
@@ -226,10 +227,11 @@ def push_to_pushplus(title, content):
             timeout=10,
         )
         result = resp.json()
-        if result.get('code') == 0:
+        # PushPlus 成功返回 code=200（旧版是 0），两种都算成功
+        if result.get('code') in (0, 200):
             print(f'✓ 推送成功: {title}')
             return True
-        print(f'✗ 推送失败: {result.get("msg")}')
+        print(f'✗ 推送失败(code={result.get("code")}): {result.get("msg") or result}')
     except Exception as e:
         print(f'推送异常: {e}')
     return False
@@ -265,6 +267,44 @@ def push_to_serverchan(title, content):
         print(f'✗ Server酱推送失败: {r.get("message") or r}')
     except Exception as e:
         print(f'Server酱推送异常: {e}')
+    return False
+
+
+def push_to_email(title, content):
+    """邮件备用通道：QQ/163 邮箱 SMTP 授权码即可，无需任何实名认证"""
+    user = os.getenv('SMTP_USER', '')
+    pwd = os.getenv('SMTP_PASS', '')
+    if not user or not pwd:
+        return False
+    host = os.getenv('SMTP_HOST', 'smtp.qq.com')
+    port = int(os.getenv('SMTP_PORT', '465'))
+    to = os.getenv('SMTP_TO', user)
+    try:
+        import smtplib
+        from email.mime.text import MIMEText
+        msg = MIMEText(re.sub(r'<[^>]+>', ' ', content), 'plain', 'utf-8')
+        msg['Subject'] = title
+        msg['From'] = user
+        msg['To'] = to
+        with smtplib.SMTP_SSL(host, port, timeout=15) as s:
+            s.login(user, pwd)
+            s.sendmail(user, [to], msg.as_string())
+        print(f'✓ 邮件推送成功 -> {to}')
+        return True
+    except Exception as e:
+        print(f'✗ 邮件推送失败: {e}')
+    return False
+
+
+def push_all(title, content):
+    """按可用性依次尝试各通道，返回是否送达"""
+    if push_to_pushplus(title, content):
+        return True
+    if push_to_serverchan(title, content):
+        return True
+    if push_to_email(title, content):
+        return True
+    print('所有推送通道均未送达')
     return False
 
 
@@ -361,9 +401,7 @@ def check_watchlist():
 
     print(f'检测到 {len(fresh)} 个放量信号')
     title, content = format_push_message(fresh)
-    ok = push_to_pushplus(title, content)
-    if not ok:
-        ok = push_to_serverchan(title, content)
+    ok = push_all(title, content)
     if ok:
         # 只有推送成功才标记，避免失败后永远不再重试
         for s in fresh:

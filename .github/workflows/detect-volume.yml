@@ -30,8 +30,12 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-          # 备用通道：Server酱 SendKey（PushPlus 未实名认证时启用）
+          # 备用通道（任选其一即可，无需实名认证）
           SCT_SENDKEY: ${{ secrets.SCT_SENDKEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
           TZ: Asia/Shanghai
           # 手动触发时跳过交易时段限制，便于测试
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
