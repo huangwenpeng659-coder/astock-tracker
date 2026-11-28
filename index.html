@@ -65,8 +65,9 @@ main{padding:12px}
 .stat .v{font-size:19px;font-weight:700;font-variant-numeric:tabular-nums}
 .stat .l{font-size:11px;color:var(--sub);margin-top:3px}
 .tabbar{position:fixed;bottom:0;left:0;right:0;background:rgba(13,18,30,.96);backdrop-filter:blur(12px);
-  border-top:1px solid var(--border);display:flex;padding:6px 0 max(6px,env(safe-area-inset-bottom));z-index:20}
-.tabbar div{flex:1;text-align:center;color:var(--sub);font-size:10px;padding:4px 0;cursor:pointer}
+  border-top:1px solid var(--border);display:flex;overflow-x:auto;scrollbar-width:none;padding:6px 0 max(6px,env(safe-area-inset-bottom));z-index:20}
+.tabbar::-webkit-scrollbar{display:none}
+.tabbar div{flex:1 0 48px;text-align:center;color:var(--sub);font-size:10px;padding:4px 0;cursor:pointer}
 .tabbar div.active{color:var(--brand)}
 .tabbar .ic{font-size:19px;display:block;margin-bottom:2px}
 .notice{font-size:11px;color:var(--sub);text-align:center;padding:14px;line-height:1.6}
@@ -88,6 +89,15 @@ main{padding:12px}
 .limitup-concept{display:inline-flex;align-items:center;gap:3px;margin:2px;padding:2px 6px;border:1px solid var(--border);border-radius:8px;color:var(--sub)}
 .limitup-concept.core{border-color:rgba(251,191,36,.55);background:rgba(251,191,36,.1);color:var(--gold)}
 .limitup-table tr:last-child td{border-bottom:none}
+.radar-theme-title{font-size:14px;font-weight:700}
+.radar-table-wrap{overflow-x:auto;margin-top:8px}
+.radar-table{width:100%;min-width:920px;border-collapse:collapse;font-size:11px}
+.radar-table th,.radar-table td{padding:7px 6px;border-bottom:1px solid rgba(30,42,66,.65);text-align:right;white-space:nowrap;vertical-align:top}
+.radar-table th{color:var(--sub);font-weight:500}
+.radar-table th:first-child,.radar-table td:first-child,.radar-table th:last-child,.radar-table td:last-child{text-align:left;white-space:normal}
+.radar-reason{min-width:240px;max-width:380px;color:var(--sub);line-height:1.6}
+.radar-warning{color:var(--gold);font-size:10px;margin-top:3px}
+.radar-score{font-size:15px;font-weight:700;color:var(--gold)}
 .hdr-right{display:flex;flex-direction:column;align-items:flex-end;gap:5px}
 .install-btn{display:none;background:linear-gradient(135deg,#2563eb,#8b5cf6);color:#fff;border:none;
   border-radius:14px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;
@@ -131,6 +141,9 @@ let watchlist = [];
 let watchScores = {};
 let tSignals = {};
 let limitupRecap = null;
+let limitupRadar = null;
+let radarRefreshing = false;
+let limitupRadarError = '';
 
 function fmt(v,d=2){return Number(v).toFixed(d)}
 
@@ -144,6 +157,7 @@ function safeParse(v, fallback){
 const VIEWS = [
   {id:'radar',name:'机会雷达',icon:'🎯'},
   {id:'limitup',name:'涨停复盘',icon:'📑'},
+  {id:'limitup-live',name:'盘中雷达',icon:'⚡'},
   {id:'dip',name:'低吸机会',icon:'🎣'},
   {id:'watchlist',name:'自选股',icon:'⭐'},
   {id:'tsignals',name:'做T信号',icon:'🔄'},
@@ -201,6 +215,15 @@ async function loadLimitupRecap(){
     if(error){console.error('加载涨停复盘失败:',error);return;}
     limitupRecap=data&&data.length?safeParse(data[0].value,null):null;
   }catch(e){console.error('加载涨停复盘失败:',e);}
+}
+
+async function loadLimitupRadar(){
+  try{
+    const {data,error}=await sb.from('config').select('value').eq('key','limitup_radar:latest').limit(1);
+    if(error){limitupRadarError=error.message||String(error);console.error('加载盘中涨停雷达失败:',error);return;}
+    limitupRadar=data&&data.length?safeParse(data[0].value,null):null;
+    limitupRadarError='';
+  }catch(e){limitupRadarError=e.message||String(e);console.error('加载盘中涨停雷达失败:',e);}
 }
 
 function todayStr(){
@@ -876,6 +899,100 @@ function renderLimitupRecap(){
   </div>${sections}`;
 }
 
+function renderLimitupRadar(){
+  const radar=limitupRadar;
+  if(!radar){
+    return `<div class="card"><div class="card-title"><div class="t"><span class="dot"></span>盘中涨停概念雷达</div></div>
+      <div class="loading">等待盘中扫描数据<br><span class="sub">GitHub Actions 交易时段每 5 分钟尽力更新</span></div></div>`;
+  }
+  const updated=String(radar.updated_at||'');
+  const parsedAt=updated?Date.parse(`${updated.replace(' ','T')}+08:00`):NaN;
+  const ageMinutes=Number.isFinite(parsedAt)?Math.max(0,Math.floor((Date.now()-parsedAt)/60000)):Infinity;
+  const stale=ageMinutes>15;
+  const statusText={
+    live:stale?'数据可能已过期':'运行中',
+    partial:'部分数据缺失',
+    outside_session:'非交易时段',
+    non_trading_day:'非交易日',
+  }[radar.status]||'等待数据';
+  const themes=Array.isArray(radar.themes)?radar.themes:[];
+  const events=Array.isArray(radar.active_events)?radar.active_events:[];
+  const newCodes=new Set((radar.new_events||[]).map(item=>item.code));
+  const kpis=[
+    ['当前封板',`${radar.active_count||0} 只`],
+    ['本轮新触发',`${radar.new_count||0} 只`],
+    ['跟踪概念',`${themes.length} 个`],
+    ['候选股',`${themes.reduce((total,theme)=>total+(theme.candidate_count||0),0)} 只`],
+  ].map(([label,value])=>`<div class="limitup-kpi"><div class="value">${value}</div><div class="label">${label}</div></div>`).join('');
+
+  const eventRows=events.slice(0,40).map(event=>{
+    const tags=(event.concepts||[]).slice(0,4).map(recapText).join(' · ')||'概念标签待补';
+    const marker=newCodes.has(event.code)?'<span class="badge buy">新触发</span>':'';
+    return `<tr>
+      <td>${marker}${recapText(event.first_seal_time||'--:--')}</td>
+      <td><b>${recapText(event.name||event.code)}</b><span class="stock-code"> ${recapText(event.code)}</span></td>
+      <td>${recapText(event.board_label||'--')}</td>
+      <td>${recapText(event.industry||'未分类')}</td>
+      <td>${tags}</td>
+      <td>${recapText(event.status||'封板')}</td>
+    </tr>`;
+  }).join('');
+
+  const themeCards=themes.map(theme=>{
+    const rows=(theme.candidates||[]).map((item,index)=>{
+      const pct=recapNumber(item.change_pct,2);
+      const pctClass=Number(item.change_pct)>=0?'up':'down';
+      const reasons=(item.reasons||[]).map(recapText).join(' · ');
+      const risks=(item.risks||[]).map(recapText).join(' · ');
+      const trend=`${item.ret_5d_pct==null?'--':`${recapNumber(item.ret_5d_pct)}%`} / ${item.ret_20d_pct==null?'--':`${recapNumber(item.ret_20d_pct)}%`}`;
+      const volumeRatio=item.volume_ratio_5m==null?'积累中':`${recapNumber(item.volume_ratio_5m,1)}x`;
+      return `<tr>
+        <td>${index+1}</td>
+        <td><b>${recapText(item.name||item.code)}</b><span class="stock-code"> ${recapText(item.code)}</span></td>
+        <td><span class="radar-score">${recapNumber(item.score,0)}</span><div class="sub">${recapText(item.tier||'观察')}</div></td>
+        <td class="${pctClass}">${pct}%</td>
+        <td>${trend}</td>
+        <td>${volumeRatio}</td>
+        <td>${recapNumber(item.turnover_pct)}%</td>
+        <td>${recapNumber(item.amount_yi)} 亿</td>
+        <td class="radar-reason">${reasons}${risks?`<div class="radar-warning">⚠ ${risks}</div>`:''}</td>
+      </tr>`;
+    }).join('');
+    return `<details class="card limitup-theme" ${themes.indexOf(theme)===0?'open':''}>
+      <summary>
+        <span class="radar-theme-title">${recapText(theme.name)} <span class="up">${theme.trigger_count||0}</span> 只涨停关联</span>
+        <span class="sub">概念涨幅 ${recapNumber(theme.change_pct)}% · 候选 ${theme.candidate_count||0} 只</span>
+      </summary>
+      ${rows?`<div class="radar-table-wrap"><table class="radar-table">
+        <thead><tr><th>#</th><th>关联股</th><th>匹配分</th><th>盘中涨幅</th><th>5/20日趋势</th><th>5分钟量比</th><th>换手</th><th>成交额</th><th>入选依据 / 风险</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>`:'<div class="notice">暂未筛到可展示的关联候选</div>'}
+    </details>`;
+  }).join('');
+  const errors=(radar.errors||[]).slice(0,5).map(error=>
+    `<div class="radar-warning">${recapText(error.theme||error.code||error.stage)}：${recapText(error.error||'数据获取失败')}</div>`
+  ).join('');
+  const eventPanel=`<div class="card">
+    <div class="card-title"><div class="t"><span class="dot"></span>当前涨停触发 ${events.length} 只</div></div>
+    ${eventRows?`<div class="radar-table-wrap"><table class="radar-table">
+      <thead><tr><th>首次封板</th><th>股票</th><th>连板</th><th>行业大类</th><th>关联概念</th><th>状态</th></tr></thead>
+      <tbody>${eventRows}</tbody>
+    </table></div>`:'<div class="notice">当前扫描未发现封板股票，或尚未到交易时段。</div>'}
+  </div>`;
+  return `<div class="card">
+    <div class="card-title">
+      <div class="t"><span class="dot" style="background:${stale?'var(--gold)':'var(--up)'}"></span>盘中涨停概念雷达 · ${recapText(statusText)}</div>
+      <button onclick="refreshLimitupRadar()" style="background:var(--card2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:5px 9px">刷新</button>
+    </div>
+    <div class="limitup-summary-grid">${kpis}</div>
+    <div class="notice">扫描时间 ${recapText(updated||'--')} · GitHub Actions 约每 5 分钟尽力扫描；调度可能延迟或漏跑。匹配分仅用于候选排序，不是收益概率或买入指令。${ageMinutes<Infinity?`数据已过 ${ageMinutes} 分钟`:''}</div>
+    ${radar.message?`<div class="notice">${recapText(radar.message)}</div>`:''}
+    ${limitupRadarError?`<div class="radar-warning">加载雷达数据失败：${recapText(limitupRadarError)}</div>`:''}
+    ${radar.score_note?`<div class="notice" style="padding-top:0">${recapText(radar.score_note)}</div>`:''}
+    ${errors}
+  </div>${eventPanel}${themeCards}`;
+}
+
 function renderDip(){
   const items=(dipData&&dipData.items)||[];
   if(!items.length){
@@ -1355,6 +1472,7 @@ async function render(){
   const banner=renderBanner();
   if(cur==='radar') v.innerHTML = banner+renderRadar();
   else if(cur==='limitup') v.innerHTML = banner+renderLimitupRecap();
+  else if(cur==='limitup-live') v.innerHTML = banner+renderLimitupRadar();
   else if(cur==='dip') v.innerHTML = banner+renderDip();
   else if(cur==='watchlist') v.innerHTML = banner+renderWatchlist();
   else if(cur==='tsignals') v.innerHTML = banner+renderTSignals();
@@ -1367,6 +1485,7 @@ async function render(){
 function go(id){
   cur=id;
   render();
+  if(id==='limitup-live') refreshLimitupRadar();
   // 切回自选股时重新拉一次，避免看到打开页面时的旧快照
   if(id==='watchlist') Promise.all([loadWatchlist(),loadVolCheck()]).then(render);
 }
@@ -1449,6 +1568,7 @@ async function init(){
   await loadDip();
   await loadVolCheck();
   await loadLimitupRecap();
+  await loadLimitupRadar();
   await loadWatchlist();
   await loadTExtra();
   await loadTSignals();
@@ -1457,7 +1577,21 @@ async function init(){
   candidates = await loadCandidates();
   if(candidates.length) selectedStock = candidates[0];
   render();
+  setInterval(()=>{
+    if(cur==='limitup-live') refreshLimitupRadar();
+  },60000);
   window.addEventListener('resize',()=>klineChart&&klineChart.resize());
+}
+
+async function refreshLimitupRadar(){
+  if(radarRefreshing) return;
+  radarRefreshing=true;
+  try{
+    await loadLimitupRadar();
+    if(cur==='limitup-live') await render();
+  }finally{
+    radarRefreshing=false;
+  }
 }
 init();
 </script>

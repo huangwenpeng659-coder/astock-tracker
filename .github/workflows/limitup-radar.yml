@@ -1,0 +1,38 @@
+name: 盘中涨停概念雷达
+
+on:
+  schedule:
+    # GitHub cron 使用 UTC；北京时间连续竞价时段，每 5 分钟尽力扫描
+    - cron: '30,35,40,45,50,55 1 * * 1-5'
+    - cron: '*/5 2 * * 1-5'
+    - cron: '0,5,10,15,20,25,30 3 * * 1-5'
+    - cron: '*/5 5-6 * * 1-5'
+    - cron: '0 7 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  build-radar:
+    concurrency:
+      group: limitup-radar
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt --prefer-binary
+
+      - name: 扫描涨停事件和概念候选股
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TZ: Asia/Shanghai
+        run: python scripts/fetch_limitup_radar.py
