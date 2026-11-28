@@ -189,10 +189,10 @@ async function loadKline(code){
   const {data,error} = await sb.from('daily_kline')
     .select('*')
     .eq('code',code)
-    .order('trade_date',{ascending:true})
+    .order('trade_date',{ascending:false})
     .limit(60);
   if(error){console.error('加载K线失败:',error);return [];}
-  return data||[];
+  return (data||[]).reverse();
 }
 
 function renderRadar(){
