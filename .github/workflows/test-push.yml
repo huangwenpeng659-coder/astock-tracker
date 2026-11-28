@@ -2,6 +2,12 @@ name: 推送通道自检
 
 on:
   workflow_dispatch:
+    inputs:
+      replay_date:
+        description: '回放日期（YYYY-MM-DD 或 yesterday）；只读取已保存的放量信号'
+        required: false
+        default: 'yesterday'
+        type: string
   schedule:
     # 每天 09:00 UTC（北京 17:00）跑一次，便于发现通道失效
     - cron: '0 0 * * 1-5'
@@ -33,4 +39,5 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          REPLAY_DATE: ${{ github.event.inputs.replay_date }}
         run: python scripts/test_push.py
