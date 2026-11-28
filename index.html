@@ -71,6 +71,20 @@ main{padding:12px}
 .tabbar .ic{font-size:19px;display:block;margin-bottom:2px}
 .notice{font-size:11px;color:var(--sub);text-align:center;padding:14px;line-height:1.6}
 .loading{text-align:center;padding:40px;color:var(--sub)}
+.limitup-summary-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.limitup-kpi{background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:10px;text-align:center}
+.limitup-kpi .value{font-size:18px;font-weight:700;color:var(--gold);font-variant-numeric:tabular-nums}
+.limitup-kpi .label{font-size:10px;color:var(--sub);margin-top:3px}
+.limitup-theme{border-left:3px solid var(--up);padding:10px}
+.limitup-theme>summary{list-style:none;display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:pointer}
+.limitup-theme>summary::-webkit-details-marker{display:none}
+.limitup-theme-title{font-weight:700}
+.limitup-table-wrap{overflow-x:auto;margin-top:8px}
+.limitup-table{width:100%;min-width:760px;border-collapse:collapse;font-size:11px}
+.limitup-table th,.limitup-table td{padding:7px 6px;border-bottom:1px solid rgba(30,42,66,.65);text-align:right;white-space:nowrap}
+.limitup-table th{color:var(--sub);font-weight:500}
+.limitup-table th:nth-child(2),.limitup-table td:nth-child(2),.limitup-table th:last-child,.limitup-table td:last-child{text-align:left}
+.limitup-table tr:last-child td{border-bottom:none}
 .hdr-right{display:flex;flex-direction:column;align-items:flex-end;gap:5px}
 .install-btn{display:none;background:linear-gradient(135deg,#2563eb,#8b5cf6);color:#fff;border:none;
   border-radius:14px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;
@@ -113,6 +127,7 @@ let lastRun = null;
 let watchlist = [];
 let watchScores = {};
 let tSignals = {};
+let limitupRecap = null;
 
 function fmt(v,d=2){return Number(v).toFixed(d)}
 
@@ -125,6 +140,7 @@ function safeParse(v, fallback){
 
 const VIEWS = [
   {id:'radar',name:'机会雷达',icon:'🎯'},
+  {id:'limitup',name:'涨停复盘',icon:'📑'},
   {id:'dip',name:'低吸机会',icon:'🎣'},
   {id:'watchlist',name:'自选股',icon:'⭐'},
   {id:'tsignals',name:'做T信号',icon:'🔄'},
@@ -174,6 +190,14 @@ async function loadVolCheck(){
     const {data}=await sb.from('config').select('value').eq('key','volume_last_check').limit(1);
     if(data&&data.length) volCheck=safeParse(data[0].value,null);
   }catch(e){console.error('加载放量检测状态失败:',e);}
+}
+
+async function loadLimitupRecap(){
+  try{
+    const {data,error}=await sb.from('config').select('value').eq('key','limitup_recap:latest').limit(1);
+    if(error){console.error('加载涨停复盘失败:',error);return;}
+    limitupRecap=data&&data.length?safeParse(data[0].value,null):null;
+  }catch(e){console.error('加载涨停复盘失败:',e);}
 }
 
 function todayStr(){
@@ -775,6 +799,69 @@ const DIP_ICON={
   '黄金坑低吸':'🕳️','突破回踩低吸':'🎯','换手假阴低吸':'🔄','龙头首阴套利':'⚡','二波低吸':'🌊'
 };
 
+function recapText(value){
+  return String(value??'').replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function recapNumber(value,digits=2){
+  const n=Number(value);
+  return Number.isFinite(n)?n.toFixed(digits):'--';
+}
+
+function renderLimitupRecap(){
+  const recap=limitupRecap;
+  const groups=recap&&Array.isArray(recap.groups)?recap.groups:[];
+  if(!recap||!groups.length){
+    return `<div class="card">
+      <div class="card-title"><div class="t"><span class="dot"></span>每日涨停复盘</div></div>
+      <div class="loading">暂无涨停复盘数据<br><span class="sub">收盘后由日更工作流自动生成</span></div>
+    </div>`;
+  }
+
+  const summary=recap.summary||{};
+  const kpis=[
+    ['收盘封板',`${summary.limitup_count||0} 只`],
+    ['非首板',`${summary.non_first_count||0} 只`],
+    ['最高连板',`${summary.max_streak||0} 板`],
+    ['行业分组',`${summary.industry_count||0} 条`],
+    ['炸板家数',`${summary.broken_count||0} 只`],
+    ['炸板率',`${recapNumber(summary.break_rate_pct,1)}%`],
+  ].map(([label,value])=>`<div class="limitup-kpi"><div class="value">${value}</div><div class="label">${label}</div></div>`).join('');
+
+  const sections=groups.map((group,index)=>{
+    const rows=(group.items||[]).map(item=>`
+      <tr>
+        <td>${recapText(item.board_label||'--')}</td>
+        <td><b>${recapText(item.name||item.code)}</b><span class="stock-code"> ${recapText(item.code)}</span></td>
+        <td>${recapText(item.first_seal_time||'--:--')}</td>
+        <td>${recapNumber(item.seal_fund_yi)}</td>
+        <td>${item.seal_to_amount==null?'--':`${recapNumber(item.seal_to_amount)}x`}</td>
+        <td>${recapNumber(item.turnover_pct)}%</td>
+        <td>${recapNumber(item.float_cap_yi)}</td>
+        <td>${recapText(item.industry||'未分类')}</td>
+      </tr>`).join('');
+    return `<details class="card limitup-theme" ${index===0?'open':''}>
+      <summary>
+        <span class="limitup-theme-title">${recapText(group.industry||'未分类')} <span class="up">${group.count||0}</span> 只</span>
+        <span class="sub">封单合计 ${recapNumber(group.seal_fund_total_yi)} 亿</span>
+      </summary>
+      <div class="limitup-table-wrap"><table class="limitup-table">
+        <thead><tr><th>板数</th><th>名称</th><th>首封</th><th>封单(亿)</th><th>封单/成交</th><th>换手</th><th>流通市值(亿)</th><th>涨停统计</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </details>`;
+  }).join('');
+
+  return `<div class="card">
+    <div class="card-title">
+      <div class="t"><span class="dot" style="background:var(--up);box-shadow:0 0 8px var(--up)"></span>${recapText(recap.trade_date)} 涨停复盘 · 行业分布</div>
+      <span class="sub">更新 ${recapText(recap.updated_at||'--')}</span>
+    </div>
+    <div class="limitup-summary-grid">${kpis}</div>
+    <div class="notice" style="padding-bottom:0">${recapText(recap.reason_note||'按行情源所属行业分组；行业标签不等于已核实的涨停原因。')}</div>
+  </div>${sections}`;
+}
+
 function renderDip(){
   const items=(dipData&&dipData.items)||[];
   if(!items.length){
@@ -1253,6 +1340,7 @@ async function render(){
   const v = document.getElementById('view');
   const banner=renderBanner();
   if(cur==='radar') v.innerHTML = banner+renderRadar();
+  else if(cur==='limitup') v.innerHTML = banner+renderLimitupRecap();
   else if(cur==='dip') v.innerHTML = banner+renderDip();
   else if(cur==='watchlist') v.innerHTML = banner+renderWatchlist();
   else if(cur==='tsignals') v.innerHTML = banner+renderTSignals();
@@ -1346,6 +1434,7 @@ async function init(){
   await loadConcepts();
   await loadDip();
   await loadVolCheck();
+  await loadLimitupRecap();
   await loadWatchlist();
   await loadTExtra();
   await loadTSignals();
