@@ -1,4 +1,4 @@
-const CACHE_NAME = 'astock-tracker-v3';
+const CACHE_NAME = 'astock-tracker-v4';
 const ASSETS_TO_CACHE = [
   './',
   './index.html',
@@ -31,6 +31,13 @@ self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
 
   const url = new URL(event.request.url);
+  const isSupabaseApi = url.hostname.endsWith('.supabase.co') &&
+    url.pathname.startsWith('/rest/v1/');
+  if (isSupabaseApi) {
+    event.respondWith(fetch(event.request, { cache: 'no-store' }));
+    return;
+  }
+
   const isDoc = event.request.mode === 'navigate' ||
     (url.origin === self.location.origin && /\.html?$/.test(url.pathname)) ||
     (url.origin === self.location.origin && url.pathname.endsWith('/'));
