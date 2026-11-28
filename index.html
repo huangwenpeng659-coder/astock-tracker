@@ -84,6 +84,9 @@ main{padding:12px}
 .limitup-table th,.limitup-table td{padding:7px 6px;border-bottom:1px solid rgba(30,42,66,.65);text-align:right;white-space:nowrap}
 .limitup-table th{color:var(--sub);font-weight:500}
 .limitup-table th:nth-child(2),.limitup-table td:nth-child(2),.limitup-table th:last-child,.limitup-table td:last-child{text-align:left}
+.limitup-table th:last-child,.limitup-table td:last-child{min-width:220px;white-space:normal}
+.limitup-concept{display:inline-flex;align-items:center;gap:3px;margin:2px;padding:2px 6px;border:1px solid var(--border);border-radius:8px;color:var(--sub)}
+.limitup-concept.core{border-color:rgba(251,191,36,.55);background:rgba(251,191,36,.1);color:var(--gold)}
 .limitup-table tr:last-child td{border-bottom:none}
 .hdr-right{display:flex;flex-direction:column;align-items:flex-end;gap:5px}
 .install-btn{display:none;background:linear-gradient(135deg,#2563eb,#8b5cf6);color:#fff;border:none;
@@ -829,7 +832,14 @@ function renderLimitupRecap(){
   ].map(([label,value])=>`<div class="limitup-kpi"><div class="value">${value}</div><div class="label">${label}</div></div>`).join('');
 
   const sections=groups.map((group,index)=>{
-    const rows=(group.items||[]).map(item=>`
+    const rows=(group.items||[]).map(item=>{
+      const allConcepts=Array.isArray(item.concepts)?item.concepts:[];
+      const concepts=allConcepts.slice(0,4).map(concept=>`
+        <span class="limitup-concept ${concept.is_core?'core':''}">
+          ${concept.is_core?'<b>核心</b> ':''}${recapText(concept.name)}
+          <span>${recapNumber(concept.limitup_count,0)}只</span>
+        </span>`).join('')+(allConcepts.length>4?`<span class="sub">+${allConcepts.length-4}</span>`:'');
+      return `
       <tr>
         <td>${recapText(item.board_label||'--')}</td>
         <td><b>${recapText(item.name||item.code)}</b><span class="stock-code"> ${recapText(item.code)}</span></td>
@@ -838,15 +848,18 @@ function renderLimitupRecap(){
         <td>${item.seal_to_amount==null?'--':`${recapNumber(item.seal_to_amount)}x`}</td>
         <td>${recapNumber(item.turnover_pct)}%</td>
         <td>${recapNumber(item.float_cap_yi)}</td>
-        <td>${recapText(item.industry||'未分类')}</td>
-      </tr>`).join('');
+        <td>${recap.schema_version>=2
+          ?(concepts||'<span class="sub">暂无行情源概念标签</span>')
+          :'<span class="sub">等待概念数据更新</span>'}</td>
+      </tr>`;
+    }).join('');
     return `<details class="card limitup-theme" ${index===0?'open':''}>
       <summary>
         <span class="limitup-theme-title">${recapText(group.industry||'未分类')} <span class="up">${group.count||0}</span> 只</span>
         <span class="sub">封单合计 ${recapNumber(group.seal_fund_total_yi)} 亿</span>
       </summary>
       <div class="limitup-table-wrap"><table class="limitup-table">
-        <thead><tr><th>板数</th><th>名称</th><th>首封</th><th>封单(亿)</th><th>封单/成交</th><th>换手</th><th>流通市值(亿)</th><th>涨停统计</th></tr></thead>
+        <thead><tr><th>板数</th><th>名称</th><th>首封</th><th>封单(亿)</th><th>封单/成交</th><th>换手</th><th>流通市值(亿)</th><th>涨停概念 / 核心</th></tr></thead>
         <tbody>${rows}</tbody>
       </table></div>
     </details>`;
@@ -859,6 +872,7 @@ function renderLimitupRecap(){
     </div>
     <div class="limitup-summary-grid">${kpis}</div>
     <div class="notice" style="padding-bottom:0">${recapText(recap.reason_note||'按行情源所属行业分组；行业标签不等于已核实的涨停原因。')}</div>
+    ${recap.schema_version>=2?'':`<div class="notice" style="padding-top:4px">当前数据是旧版复盘；运行“全市场涨停复盘”工作流后显示概念标签。</div>`}
   </div>${sections}`;
 }
 

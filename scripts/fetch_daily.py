@@ -14,6 +14,11 @@ import akshare as ak
 import requests
 from supabase import create_client
 
+if __package__:
+    from .concept_data import get_stock_concepts, http_json as _http_json
+else:
+    from concept_data import get_stock_concepts, http_json as _http_json
+
 # 统一使用北京时间：CI runner 默认 UTC，直接用 datetime.now() 会导致交易日错位
 try:
     from zoneinfo import ZoneInfo
@@ -210,59 +215,6 @@ def get_stock_name(code, fallback=None):
     if fallback and fallback != code:
         return fallback
     return str(code)
-
-# ============ 概念板块 ============
-_CONCEPT_BOARDS = None
-_CONCEPT_CODE_SET = set()
-
-def _http_json(url, params, tries=3):
-    """带重试的GET请求（东财接口偶发断连）"""
-    last = None
-    for i in range(tries):
-        try:
-            r = requests.get(url, params=params, timeout=25, headers={'User-Agent': 'Mozilla/5.0'})
-            r.encoding = 'utf-8'
-            return r.json()
-        except Exception as e:
-            last = e
-            time.sleep(1.5 * (i + 1))
-    print(f"  请求失败 {url}: {last}")
-    return None
-
-def _load_concept_boards():
-    """概念板块代码集合（东财 m:90+t:3）"""
-    global _CONCEPT_BOARDS, _CONCEPT_CODE_SET
-    if _CONCEPT_BOARDS is not None:
-        return _CONCEPT_BOARDS
-    boards = {}
-    j = _http_json('https://push2.eastmoney.com/api/qt/clist/get',
-                   {'pn': '1', 'pz': '600', 'po': '1', 'np': '1', 'fltt': '2', 'invt': '2',
-                    'fid': 'f3', 'fs': 'm:90+t:3+f:!50', 'fields': 'f12,f14'})
-    for x in ((j or {}).get('data') or {}).get('diff') or []:
-        boards[x['f12']] = x['f14']
-    _CONCEPT_BOARDS = boards
-    _CONCEPT_CODE_SET = set(boards.keys())
-    print(f"加载概念板块 {len(boards)} 个")
-    return boards
-
-def get_stock_concepts(code):
-    """返回该股所属概念板块名称列表"""
-    boards = _load_concept_boards()
-    if not boards:
-        return []
-    j = _http_json('https://push2.eastmoney.com/api/qt/slist/get',
-                   {'fltt': '2', 'invt': '2', 'fields': 'f12,f14',
-                    'secid': f'{1 if code.startswith("6") else 0}.{code}', 'pn': '1', 'pz': '100',
-                    'po': '1', 'np': '1', 'fid': 'f62', 'spt': '3'})
-    diff = ((j or {}).get('data') or {}).get('diff') or []
-    concepts = []
-    for x in diff:
-        bid = x.get('f12')
-        if bid in _CONCEPT_CODE_SET:
-            nm = boards.get(bid) or x.get('f14')
-            if nm and nm not in concepts:
-                concepts.append(nm)
-    return concepts[:12]
 
 def save_stock_concepts(code, name, concepts):
     """概念写入 config KV（键 concepts:<code>），无需新建表"""

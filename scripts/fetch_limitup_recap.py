@@ -3,10 +3,17 @@ import json
 import math
 import os
 import re
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 
 import akshare as ak
 import pandas as pd
+
+if __package__:
+    from .concept_data import get_stock_concepts, load_concept_boards
+else:
+    from concept_data import get_stock_concepts, load_concept_boards
 
 try:
     from zoneinfo import ZoneInfo
@@ -15,6 +22,7 @@ except Exception:
     CN_TZ = timezone(timedelta(hours=8))
 
 CONFIG_KEY = "limitup_recap:latest"
+MIN_CORE_CONCEPT_LIMITUPS = 2
 LIMITUP_COLUMNS = {
     "代码", "名称", "连板数", "涨停统计", "首次封板时间",
     "封板资金", "成交额", "换手率", "流通市值", "所属行业",
@@ -118,8 +126,58 @@ def _broken_codes(frame):
     return {code for code in (_code(value) for value in frame["代码"]) if code}
 
 
-def build_recap(limitups, broken, trade_date, updated_at):
+def fetch_market_concepts(codes, max_workers=6):
+    load_concept_boards(strict=True, tries=2, timeout=10)
+
+    def fetch_one(code):
+        try:
+            return code, get_stock_concepts(
+                code,
+                strict=True,
+                tries=2,
+                timeout=10,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"获取 {code} 的概念标签失败: {exc}") from exc
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return dict(executor.map(fetch_one, codes))
+
+
+def _apply_concepts(stocks, concepts_by_code):
+    names_by_code = {}
+    for stock in stocks:
+        names = []
+        for value in concepts_by_code.get(stock["code"], []):
+            name = _text(value)
+            if name and name not in names:
+                names.append(name)
+        names_by_code[stock["code"]] = names
+
+    limitup_counts = Counter(
+        concept
+        for names in names_by_code.values()
+        for concept in names
+    )
+    for stock in stocks:
+        names = names_by_code[stock["code"]]
+        peak_count = max((limitup_counts[name] for name in names), default=0)
+        stock["concepts"] = [
+            {
+                "name": name,
+                "limitup_count": limitup_counts[name],
+                "is_core": (
+                    limitup_counts[name] == peak_count
+                    and peak_count >= MIN_CORE_CONCEPT_LIMITUPS
+                ),
+            }
+            for name in sorted(names, key=lambda item: (-limitup_counts[item], item))
+        ]
+
+
+def build_recap(limitups, broken, trade_date, updated_at, concepts_by_code=None):
     stocks = _normalise_limitups(limitups)
+    _apply_concepts(stocks, concepts_by_code or {})
     limitup_codes = {stock["code"] for stock in stocks}
     broken_codes = _broken_codes(broken) - limitup_codes
     groups = {}
@@ -147,6 +205,7 @@ def build_recap(limitups, broken, trade_date, updated_at):
     denominator = len(stocks) + broken_count
 
     return {
+        "schema_version": 2,
         "trade_date": trade_date,
         "updated_at": updated_at,
         "summary": {
@@ -160,7 +219,10 @@ def build_recap(limitups, broken, trade_date, updated_at):
             "seal_fund_total_yi": round(sum(stock["seal_fund_yi"] for stock in stocks), 2),
         },
         "groups": group_items,
-        "reason_note": "按行情源所属行业归类；行业标签不代表经过资讯核实的涨停原因。",
+        "reason_note": (
+            "大类按行情源所属行业归类。核心概念按东财概念归属中当日涨停股聚集度最高的标签标注"
+            "（至少2只）；仅表示题材关联，不代表公告或新闻已核实的直接涨停原因。"
+        ),
     }
 
 
@@ -174,11 +236,15 @@ def main():
     print(f"获取 {trade_date} 全市场涨停与炸板数据...")
     limitups = ak.stock_zt_pool_em(date=trade_date)
     broken = ak.stock_zt_pool_zbgc_em(date=trade_date)
+    stocks = _normalise_limitups(limitups)
+    print(f"获取 {len(stocks)} 只涨停股的东财概念标签...")
+    concepts_by_code = fetch_market_concepts([stock["code"] for stock in stocks])
     recap = build_recap(
         limitups,
         broken,
         f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:]}",
         datetime.now(CN_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+        concepts_by_code=concepts_by_code,
     )
 
     from supabase import create_client

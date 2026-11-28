@@ -78,6 +78,32 @@ class LimitupRecapTests(unittest.TestCase):
 
         self.assertEqual(latest_trade_date(calendar, date(2026, 11, 28)), '20261127')
 
+    def test_marks_core_concept_by_full_market_limitup_concentration(self):
+        recap = build_recap(
+            self.limitups,
+            self.broken,
+            '2026-11-27',
+            '2026-11-28 15:35:00',
+            concepts_by_code={
+                '000001': ['算力', '并购重组'],
+                '000002': ['算力'],
+                '600003': ['鸿蒙概念'],
+            },
+        )
+        stocks = {
+            stock['code']: stock
+            for group in recap['groups']
+            for stock in group['items']
+        }
+
+        self.assertEqual(
+            [(item['name'], item['is_core'], item['limitup_count'])
+             for item in stocks['000001']['concepts']],
+            [('算力', True, 2), ('并购重组', False, 1)],
+        )
+        self.assertFalse(stocks['600003']['concepts'][0]['is_core'])
+        self.assertIn('不代表公告或新闻', recap['reason_note'])
+
     def test_rejects_empty_limitup_pool(self):
         with self.assertRaisesRegex(ValueError, '涨停池为空'):
             build_recap(pd.DataFrame(), self.broken, '2026-11-27', 'now')
